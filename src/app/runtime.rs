@@ -3,9 +3,7 @@ use std::time::Instant;
 #[cfg(test)]
 use std::time::Duration;
 
-use super::{
-    background_update_check_enabled, App, AUTO_UPDATE_CHECK_INTERVAL, MIN_RENDER_INTERVAL,
-};
+use super::{background_update_check_enabled, App, AUTO_UPDATE_CHECK_INTERVAL};
 fn retain_detached_process_after_wait(
     pid: u32,
     result: std::io::Result<Option<std::process::ExitStatus>>,
@@ -73,7 +71,7 @@ impl App {
 
     pub(crate) fn can_render_now(&self, now: Instant) -> bool {
         match self.last_render_at {
-            Some(last_render_at) => now.duration_since(last_render_at) >= MIN_RENDER_INTERVAL,
+            Some(last_render_at) => now.duration_since(last_render_at) >= self.render_interval,
             None => true,
         }
     }
@@ -81,7 +79,7 @@ impl App {
     pub(crate) fn can_present_now(&self, now: Instant) -> bool {
         match self.last_presentation_at {
             Some(last_presentation_at) => {
-                now.duration_since(last_presentation_at) >= MIN_RENDER_INTERVAL
+                now.duration_since(last_presentation_at) >= self.render_interval
             }
             None => true,
         }
@@ -148,7 +146,7 @@ impl App {
     ) -> Option<Instant> {
         let render_deadline = if needs_render {
             self.last_render_at
-                .map(|last_render_at| last_render_at + MIN_RENDER_INTERVAL)
+                .map(|last_render_at| last_render_at + self.render_interval)
                 .filter(|deadline| *deadline > now)
         } else {
             None
@@ -222,7 +220,7 @@ mod tests {
         let initial_presentation = Instant::now();
         app.record_render_attempt(initial_presentation, true);
 
-        let hidden_attempt = initial_presentation + MIN_RENDER_INTERVAL;
+        let hidden_attempt = initial_presentation + app.render_interval;
         app.record_render_attempt(hidden_attempt, false);
         let foreground_echo = hidden_attempt + Duration::from_millis(1);
 

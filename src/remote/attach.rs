@@ -678,6 +678,13 @@ pub(super) struct PreparedRemoteHerdr {
     stop_after_install_approved: bool,
 }
 
+#[cfg(feature = "gui")]
+impl PreparedRemoteHerdr {
+    pub(super) fn stop_after_install_approved(&self) -> bool {
+        self.stop_after_install_approved
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct ManagedSshOptions {
     config_path: PathBuf,
@@ -773,9 +780,39 @@ fn authentication_command_with_config(
 
 pub(super) struct RemoteSsh {
     target: String,
-    session_name: String,
+    pub(super) session_name: String,
     managed_config: Option<ManagedSshConfig>,
     noninteractive: bool,
+    /// Answers given up front by a client without a terminal, such as the desktop app.
+    pub(super) setup_consent: Option<RemoteSetupConsent>,
+}
+
+/// Up-front answers to the remote setup questions `herdr --remote` asks on a terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RemoteSetupConsent {
+    /// Install or update the matching herdr binary on the remote machine.
+    pub(crate) install: bool,
+    /// Stop an incompatible running remote server, ending its pane processes.
+    pub(crate) stop_running_server: bool,
+}
+
+/// Setup needs to stop a running remote server, which ends its panes, and the
+/// caller has not consented to that yet.
+#[derive(Debug)]
+pub(crate) struct RemoteServerStopRequired {
+    pub(crate) message: String,
+}
+
+impl std::fmt::Display for RemoteServerStopRequired {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RemoteServerStopRequired {}
+
+fn stop_required(message: String) -> io::Error {
+    io::Error::other(RemoteServerStopRequired { message })
 }
 
 impl RemoteSsh {
@@ -795,6 +832,7 @@ impl RemoteSsh {
             session_name,
             managed_config,
             noninteractive: false,
+            setup_consent: None,
         }
     }
 
@@ -1365,6 +1403,7 @@ fn prepare_discovered_remote_herdr(
             &ssh.destination(),
             &remote_herdr,
             &install_source_description(&remote_herdr.platform, override_binary.as_deref()),
+            ssh.setup_consent,
         )?;
     }
     let source = resolve_install_source(&remote_herdr.platform, override_binary)?;
@@ -1447,6 +1486,7 @@ fn prepare_windows_remote_herdr(
             &ssh.destination(),
             &remote_herdr,
             &install_source_description(&remote_herdr.platform, override_package.as_deref()),
+            ssh.setup_consent,
         )?;
     }
     // Windows needs the complete package, including its app-local ConPTY runtime.
@@ -1945,7 +1985,7 @@ impl RemoteServerStatus {
     }
 }
 
-fn ensure_remote_server_ready(
+pub(super) fn ensure_remote_server_ready(
     ssh: &RemoteSsh,
     remote_herdr: &RemoteHerdr,
     stop_after_install_approved: bool,
@@ -1990,7 +2030,12 @@ fn ensure_remote_server_ready(
         return Ok(());
     }
 
-    if confirm_remote_server_stop(&ssh.destination(), version.as_deref(), reason)? {
+    if confirm_remote_server_stop(
+        &ssh.destination(),
+        version.as_deref(),
+        reason,
+        ssh.setup_consent,
+    )? {
         stop_remote_server(ssh, remote_herdr)?;
     }
     Ok(())
@@ -2005,6 +2050,8 @@ fn confirm_remote_install_with_running_server(
     let target = ssh.destination();
     let status = match remote_server_status(ssh, remote_herdr, require_surface_interest) {
         Ok(status) => status,
+        // An unreadable status means no server answered; installing cannot interrupt it.
+        Err(_) if ssh.setup_consent.is_some_and(|consent| consent.install) => return Ok(false),
         Err(err) => {
             if !io::stdin().is_terminal() {
                 return Err(io::Error::other(format!(
@@ -2049,6 +2096,20 @@ fn confirm_remote_install_with_running_server(
         live_handoff_enabled,
         require_surface_interest,
     );
+
+    if let Some(consent) = ssh.setup_consent {
+        return match plan {
+            RemoteInstallRunningServerPlan::KeepRunning
+            | RemoteInstallRunningServerPlan::LiveHandoff => Ok(false),
+            RemoteInstallRunningServerPlan::StopRequired(_) if consent.stop_running_server => {
+                Ok(true)
+            }
+            RemoteInstallRunningServerPlan::StopRequired(_) => Err(stop_required(format!(
+                "herdr on {target} is running v{} and must restart to update, which stops its panes",
+                version_label(version.as_deref())
+            ))),
+        };
+    }
 
     if plan == RemoteInstallRunningServerPlan::KeepRunning {
         if io::stdin().is_terminal() {
@@ -2279,6 +2340,7 @@ fn confirm_remote_server_stop(
     target: &str,
     version: Option<&str>,
     reason: RemoteServerRestartReason,
+    consent: Option<RemoteSetupConsent>,
 ) -> io::Result<bool> {
     let required_upgrade = matches!(
         reason,
@@ -2286,6 +2348,18 @@ fn confirm_remote_server_stop(
             | RemoteServerRestartReason::SurfaceInterest
             | RemoteServerRestartReason::HealthCheck
     );
+    if let Some(consent) = consent {
+        if consent.stop_running_server {
+            return Ok(true);
+        }
+        if required_upgrade {
+            return Err(stop_required(format!(
+                "herdr on {target} is running v{} and must restart to finish updating, which stops its panes",
+                version_label(version)
+            )));
+        }
+        return Ok(false);
+    }
     if !io::stdin().is_terminal() {
         if required_upgrade {
             return Err(io::Error::other(format!(
@@ -2612,7 +2686,27 @@ fn confirm_remote_install(
     target: &str,
     remote_herdr: &RemoteHerdr,
     source_description: &str,
+    consent: Option<RemoteSetupConsent>,
 ) -> io::Result<()> {
+    if let Some(consent) = consent {
+        if consent.install {
+            tracing::info!(
+                target,
+                source = source_description,
+                path = %remote_herdr.executable.display(),
+                "installing remote herdr with client consent"
+            );
+            return Ok(());
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "matching remote herdr {} is not installed at {}",
+                current_version(),
+                remote_herdr.executable.display()
+            ),
+        ));
+    }
     if !io::stdin().is_terminal() {
         return Err(io::Error::other(format!(
             "matching remote herdr {} is not installed at {}; run from an interactive terminal to approve installation",
@@ -3990,6 +4084,7 @@ mod tests {
             session_name: crate::session::DEFAULT_SESSION_NAME.into(),
             managed_config: Some(managed_config),
             noninteractive: false,
+            setup_consent: None,
         };
 
         let command = ssh.command();
@@ -4061,6 +4156,7 @@ mod tests {
             session_name: crate::session::DEFAULT_SESSION_NAME.into(),
             managed_config: Some(managed_config),
             noninteractive: false,
+            setup_consent: None,
         };
         let args = ssh
             .command()
@@ -4140,6 +4236,7 @@ mod tests {
             session_name: "probe-options".into(),
             managed_config: Some(managed_config),
             noninteractive: false,
+            setup_consent: None,
         };
         let remote = RemoteHerdr::for_platform(RemotePlatform {
             os: "linux",
@@ -4271,6 +4368,7 @@ mod tests {
             session_name: crate::session::DEFAULT_SESSION_NAME.into(),
             managed_config: None,
             noninteractive: false,
+            setup_consent: None,
         };
 
         let command = ssh.command();

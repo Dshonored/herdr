@@ -129,10 +129,10 @@ fn set_handshake_recv_timeout(
 }
 
 #[derive(Debug)]
-pub(super) struct HandshakeResult {
-    pub(super) encoding: RenderEncoding,
-    pub(super) endpoint_methods: Option<Vec<String>>,
-    pub(super) endpoint_capabilities: Option<Vec<String>>,
+pub(crate) struct HandshakeResult {
+    pub(crate) encoding: RenderEncoding,
+    pub(crate) endpoint_methods: Option<Vec<String>>,
+    pub(crate) endpoint_capabilities: Option<Vec<String>>,
 }
 
 pub(crate) fn probe_endpoint_negotiation(
@@ -164,7 +164,7 @@ pub(crate) fn probe_endpoint_negotiation(
 /// shells use the stable endpoint generation and negotiate whole codecs without
 /// comparing Herdr build versions. `local_transport` means the endpoint shares the
 /// client's filesystem, not merely that its bridge exposes a local socket.
-pub(super) fn do_handshake(
+pub(crate) fn do_handshake(
     stream: &mut LocalStream,
     cols: u16,
     rows: u16,

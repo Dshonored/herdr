@@ -292,6 +292,18 @@ pub fn wait_for_server_socket(socket_path: &Path, timeout: Duration) -> io::Resu
 // Auto-detect launch
 // ---------------------------------------------------------------------------
 
+/// Starts the local server daemon when none is listening, without attaching a
+/// terminal client. Used by clients that are not terminals, such as `herdr gui`.
+#[cfg(feature = "gui")]
+pub fn ensure_local_server() -> io::Result<()> {
+    if is_server_listening()? {
+        return Ok(());
+    }
+    info!("no server running, spawning server daemon");
+    spawn_server_daemon()?;
+    wait_for_server_socket(&client_socket_path(), SERVER_READY_TIMEOUT)
+}
+
 /// Performs auto-detect launch: check for server, spawn if needed, then
 /// attach as a thin client.
 ///

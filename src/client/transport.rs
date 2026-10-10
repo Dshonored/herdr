@@ -101,9 +101,9 @@ pub(super) fn server_reader_thread(
     }
 }
 
-struct EndpointReader<'a> {
-    stream: &'a mut LocalStream,
-    stopped: &'a AtomicBool,
+pub(crate) struct EndpointReader<'a> {
+    pub(crate) stream: &'a mut LocalStream,
+    pub(crate) stopped: &'a AtomicBool,
 }
 
 impl io::Read for EndpointReader<'_> {

@@ -10,6 +10,8 @@ use super::{
 };
 
 pub const MAX_TOAST_DELAY_SECONDS: u64 = 3600;
+/// Default `[ui] max_fps`: the server renders at most 60 frames per second.
+pub const DEFAULT_MAX_FPS: u16 = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -958,6 +960,8 @@ pub struct UiConfig {
     pub right_click_passthrough_modifier: RightClickPassthroughModifierConfig,
     /// Force a full host-terminal redraw when the outer terminal regains focus. Default: true.
     pub redraw_on_focus_gained: bool,
+    /// Most terminal frames per second the server sends to clients (30-240). Default: 60.
+    pub max_fps: u16,
     /// Lines to scroll per mouse wheel notch. Default: 3.
     pub mouse_scroll_lines: Option<NonZeroUsize>,
     /// Ask for confirmation before closing a workspace. Default: true.
@@ -1209,6 +1213,7 @@ impl Default for UiConfig {
             host_cursor: HostCursorModeConfig::Auto,
             right_click_passthrough_modifier: RightClickPassthroughModifierConfig::default(),
             redraw_on_focus_gained: true,
+            max_fps: DEFAULT_MAX_FPS,
             mouse_scroll_lines: None,
             confirm_close: true,
             prompt_new_tab_name: true,
@@ -1830,6 +1835,13 @@ right_click_passthrough_modifier = "{value}"
                 "value {value:?} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn max_fps_defaults_to_sixty_and_parses() {
+        assert_eq!(Config::default().ui.max_fps, 60);
+        let config: Config = toml::from_str("[ui]\nmax_fps = 120\n").unwrap();
+        assert_eq!(config.ui.max_fps, 120);
     }
 
     #[test]

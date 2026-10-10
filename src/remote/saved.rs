@@ -40,6 +40,29 @@ pub(crate) fn connect_saved_ssh(
     })
 }
 
+#[cfg(feature = "gui")]
+/// Makes a saved machine ready without a terminal: checks the remote herdr,
+/// installs or updates it when needed, and restarts an incompatible running
+/// server only when `consent` allows stopping it.
+pub(crate) fn prepare_saved_ssh(
+    profile_id: &str,
+    target: &str,
+    session: &str,
+    consent: super::attach::RemoteSetupConsent,
+) -> io::Result<()> {
+    let mut ssh = validated_saved_ssh(profile_id, target, session)?;
+    session.clone_into(&mut ssh.session_name);
+    ssh.setup_consent = Some(consent);
+    let prepared = super::attach::prepare_remote_herdr(&ssh, false, true)?;
+    super::attach::ensure_remote_server_ready(
+        &ssh,
+        &prepared.remote_herdr,
+        prepared.stop_after_install_approved(),
+        false,
+        true,
+    )
+}
+
 pub(crate) struct SavedSshApiBridge {
     path: PathBuf,
     bridge: SshStdioBridge,

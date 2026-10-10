@@ -37,6 +37,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(16);
+const MIN_MAX_FPS: u16 = 30;
+const MAX_MAX_FPS: u16 = 240;
+
+/// Shortest time between rendered frames for `[ui] max_fps`; 60 keeps the 16ms default.
+fn render_interval_for(max_fps: u16) -> Duration {
+    let fps = max_fps.clamp(MIN_MAX_FPS, MAX_MAX_FPS);
+    if fps == 60 {
+        return MIN_RENDER_INTERVAL;
+    }
+    Duration::from_micros(1_000_000 / u64::from(fps))
+}
 const GIT_REMOTE_STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
 const GIT_REPO_DISCOVERY_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const AUTO_UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
@@ -158,6 +169,8 @@ pub struct App {
     pub(crate) last_render_at: Option<Instant>,
     /// Last attempt that could update a connected presentation surface.
     pub(crate) last_presentation_at: Option<Instant>,
+    /// Minimum time between renders, from `[ui] max_fps`.
+    pub(crate) render_interval: Duration,
     pub render_notify: Arc<Notify>,
     pub(crate) render_dirty: Arc<crate::render_signal::RenderSignal>,
     pub(crate) full_redraw_pending: bool,
@@ -668,6 +681,7 @@ impl App {
             persist_pane_history: config.experimental.pane_history,
             last_render_at: None,
             last_presentation_at: None,
+            render_interval: render_interval_for(config.ui.max_fps),
             api_rx,
             event_hub,
             last_focus,
@@ -913,6 +927,7 @@ impl App {
                 self.configure_window_title(&config.ui.window_title);
                 self.state.agent_panel_sort =
                     agent_panel_sort_from_config(config.ui.agent_panel_sort);
+                self.render_interval = render_interval_for(config.ui.max_fps);
                 self.state.sidebar_agents = config.ui.sidebar.agents.clone();
                 self.state.sidebar_spaces = config.ui.sidebar.spaces.clone();
                 self.state.sound = config.ui.sound.clone();

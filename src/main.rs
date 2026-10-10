@@ -24,6 +24,8 @@ mod copy_mode;
 mod detect;
 mod events;
 use ghostty_vt as ghostty;
+#[cfg(feature = "gui")]
+mod gui;
 mod handoff_runtime;
 mod input;
 mod integration;
@@ -277,6 +279,10 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Set false to reduce visible flashing when switching back to Herdr.
 # Trade-off: rare host terminal surface corruption may persist until the next full redraw.
 # redraw_on_focus_gained = true
+
+# Most terminal frames per second sent to clients (30-240).
+# Raise to 120 for smoother output on high refresh rate displays; uses more CPU.
+# max_fps = 60
 
 # Pane scrollback lines to scroll per mouse wheel notch.
 # mouse_scroll_lines = 3
@@ -568,6 +574,17 @@ fn main() -> io::Result<()> {
 
     if args.get(1).map(|s| s.as_str()) == Some("server") {
         return server::headless::run_server();
+    }
+
+    if args.get(1).map(String::as_str) == Some("gui") {
+        #[cfg(feature = "gui")]
+        return gui::run();
+        #[cfg(not(feature = "gui"))]
+        {
+            eprintln!("error: this herdr build does not include the desktop app");
+            eprintln!("rebuild with `cargo build --release --features gui`");
+            std::process::exit(2);
+        }
     }
 
     // Hidden client mode: connect to an existing server's client socket.

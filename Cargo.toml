@@ -12,6 +12,9 @@ categories = ["command-line-utilities"]
 include = [
     "src/**/*",
     "assets/sounds/*",
+    "assets/herdr.ico",
+    "assets/herdr.rc",
+    "assets/logo.png",
     "docs/next/api/herdr-api.schema.json",
     "skills/herdr/SKILL.md",
     "distribution/install.ps1",
@@ -44,7 +47,7 @@ serde = { version = "1", features = ["derive"] }
 serde_ignored = "0.1.14"
 serde_json = "1"
 sha2 = "0.10"
-time = { version = "0.3.47", features = ["formatting"] }
+time = { version = "0.3.47", features = ["formatting", "parsing"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "signal"] }
 toml = "0.8"
 tracing = "0.1.44"
@@ -52,6 +55,15 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 unicode-width = "0.2"
 unicode-segmentation = "1.13.1"
 schemars = { version = "1.2.1", features = ["derive"] }
+# Native desktop client (`herdr gui`); opt-in because it pulls in a GPU UI stack.
+gpui = { version = "0.2.2", optional = true }
+# Wakes the GUI's async UI loop from endpoint reader threads.
+futures = { version = "0.3", optional = true }
+# Edits config.toml from the desktop app's settings while keeping comments and layout.
+toml_edit = { version = "0.22", optional = true }
+
+[features]
+gui = ["dep:gpui", "dep:futures", "dep:toml_edit"]
 
 [patch.crates-io]
 portable-pty = { path = "vendor/portable-pty" }
@@ -60,6 +72,10 @@ portable-pty = { path = "vendor/portable-pty" }
 # logind's delay inhibitor lets the server save before host shutdown kills panes.
 zbus = { version = "5.19", default-features = false, features = ["tokio"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+[target.'cfg(windows)'.build-dependencies]
+# Embeds the app icon into herdr.exe for `--features gui` (window, taskbar, Explorer).
+embed-resource = "3"
 
 [target.'cfg(windows)'.dependencies]
 # UTF-16 SDDL input for interprocess security descriptors.

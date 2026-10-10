@@ -941,6 +941,12 @@
           "description": "Force a full host-terminal redraw when the outer terminal regains focus."
         },
         {
+          "key": "ui.max_fps",
+          "type": "integer",
+          "default": "60",
+          "description": "Most terminal frames per second the server sends to clients, from 30 to 240. Raise to 120 for smoother output on high refresh rate displays at the cost of more CPU."
+        },
+        {
           "key": "ui.mouse_scroll_lines",
           "type": "integer",
           "default": "3",

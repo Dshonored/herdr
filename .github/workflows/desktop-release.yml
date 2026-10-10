@@ -1,0 +1,166 @@
+name: Desktop release
+
+# Builds the desktop app (`herdr gui`, `--features gui`) for each platform.
+# Pushing a `desktop-v<semver>` tag publishes a GitHub Release that the app's updater reads.
+# Running it by hand builds the same artifacts without publishing.
+
+on:
+  push:
+    tags:
+      - "desktop-v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: version embedded in a test build (no release is published)
+        required: true
+        default: 0.0.0
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  RUST_TOOLCHAIN_VERSION: 1.96.1
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            version="${GITHUB_REF_NAME#desktop-v}"
+          else
+            version="$INPUT_VERSION"
+          fi
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "error: desktop version must look like 1.2.3, got '$version'" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            asset: herdr-desktop-linux-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset: herdr-desktop-macos-aarch64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            asset: herdr-desktop-macos-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: herdr-desktop-windows-x86_64.zip
+    env:
+      HERDR_DESKTOP_VERSION: ${{ needs.version.outputs.version }}
+      HERDR_DESKTOP_REPO: ${{ github.repository }}
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          targets: ${{ matrix.target }}
+
+      - name: Install Zig
+        uses: vercel-labs/setup-zig@83c1594f26b86da8a9a8ddd9b5ee5f3af0f96943 # v1.0.2
+        with:
+          version: 0.16.0
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxcb-xkb-dev \
+            libfontconfig1-dev libfreetype6-dev libvulkan-dev libzstd-dev libssl-dev
+
+      - name: Install macOS build dependencies
+        if: runner.os == 'macOS'
+        run: brew install cmake ninja
+
+      - name: Build
+        run: cargo build --release --locked --features gui --target ${{ matrix.target }}
+
+      - name: Package (Linux, macOS)
+        if: runner.os != 'Windows'
+        run: cp target/${{ matrix.target }}/release/herdr ${{ matrix.asset }}
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          .\scripts\package_windows_conpty.ps1 `
+            -HerdrExe target\${{ matrix.target }}\release\herdr.exe `
+            -PackagePath (Join-Path $env:RUNNER_TEMP "Microsoft.Windows.Console.ConPTY.nupkg") `
+            -StageDir (Join-Path $env:RUNNER_TEMP "herdr-desktop-windows-x86_64") `
+            -OutputPath ${{ matrix.asset }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          retention-days: 7
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum herdr-desktop-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        working-directory: dist
+        run: |
+          cat > notes.md <<EOF
+          herdr desktop $VERSION.
+
+          | Platform | Download |
+          | --- | --- |
+          | Windows x86_64 | \`herdr-desktop-windows-x86_64.zip\` (unzip, run \`herdr.exe gui\`) |
+          | macOS Apple Silicon | \`herdr-desktop-macos-aarch64\` |
+          | macOS Intel | \`herdr-desktop-macos-x86_64\` |
+          | Linux x86_64 | \`herdr-desktop-linux-x86_64\` |
+
+          On macOS and Linux, make the file executable and run \`./herdr-desktop-<platform> gui\`.
+          Builds are unsigned: macOS may need right-click → Open the first time.
+          Installed copies update themselves from this page (Settings → Updates).
+          EOF
+          gh release create "$GITHUB_REF_NAME" herdr-desktop-* SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "herdr desktop $VERSION" \
+            --notes-file notes.md \
+            --generate-notes

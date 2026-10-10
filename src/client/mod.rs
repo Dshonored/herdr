@@ -113,8 +113,9 @@ use frame_output::{
     contains_kitty_graphics_bytes, record_received_kitty_graphics,
     write_encoded_frame_with_graphics,
 };
+pub(crate) use handshake::do_handshake;
 pub(crate) use handshake::probe_endpoint_negotiation;
-use handshake::{client_shell_keybinding_source, do_handshake, is_remote_client_process};
+use handshake::{client_shell_keybinding_source, is_remote_client_process};
 #[cfg(test)]
 use handshake::{
     direct_graphics_profile_values, handshake_read_timeout, REMOTE_HANDSHAKE_READ_TIMEOUT,
@@ -124,6 +125,8 @@ use notifications::{handle_notify, handle_shell_notification_effects};
 use notifications::{handle_notify_with_notifiers, sound_from_notify_message};
 #[cfg(test)]
 use terminal_sessions::terminal_control_command_from_json;
+#[cfg(feature = "gui")]
+pub(crate) use transport::EndpointReader;
 
 #[cfg(unix)]
 use std::collections::HashMap;
@@ -146,7 +149,7 @@ use crate::protocol::{AttachScrollDirection, AttachScrollSource, NotifyKind};
 use crate::server::socket_paths::client_socket_path;
 
 /// The decoder for whichever optional surface encodings this connection negotiated.
-fn negotiated_surface_decoder(
+pub(crate) fn negotiated_surface_decoder(
     negotiation: &endpoint::EndpointNegotiation,
 ) -> Option<protocol::surface_reuse::Decoder> {
     let reuse = negotiation.supports_capability(protocol::surface_reuse::CAPABILITY);
