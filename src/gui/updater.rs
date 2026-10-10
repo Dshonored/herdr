@@ -191,8 +191,7 @@ pub(crate) fn download(release: &Release) -> Result<StagedUpdate, String> {
     let files = dir.join("files");
     std::fs::create_dir_all(&files).map_err(|e| e.to_string())?;
     if asset.ends_with(".zip") {
-        // bsdtar ships with Windows 10 and later and reads zip archives.
-        let status = std::process::Command::new("tar")
+        let status = std::process::Command::new(zip_tar())
             .arg("-xf")
             .arg(&download)
             .arg("-C")
@@ -220,6 +219,15 @@ pub(crate) fn download(release: &Release) -> Result<StagedUpdate, String> {
         release: release.clone(),
         dir,
     })
+}
+
+/// Windows' bundled bsdtar (Windows 10 and later) reads zip archives. Name it by path:
+/// a `tar` earlier on PATH, such as Git Bash's GNU tar, cannot.
+fn zip_tar() -> PathBuf {
+    std::env::var_os("SystemRoot")
+        .map(|root| PathBuf::from(root).join("System32").join("tar.exe"))
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from("tar"))
 }
 
 fn staged_files(root: &Path, relative: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
