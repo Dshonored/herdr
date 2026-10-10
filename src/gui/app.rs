@@ -41,6 +41,11 @@ use super::usage_view::{self, UsageState};
 
 const SIDEBAR_WIDTH: f32 = 264.0;
 const USAGE_REFRESH: Duration = Duration::from_secs(60);
+/// Fewest milliseconds between resizes sent while the window is being dragged; the TUI
+/// client polls its terminal size at the same 100ms cadence.
+const RESIZE_INTERVAL: Duration = Duration::from_millis(100);
+/// Longest wait for the server to answer a resize before sending the next one.
+const RESIZE_REPLY_TIMEOUT: Duration = Duration::from_millis(500);
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 3600);
 const FIRST_UPDATE_CHECK: Duration = Duration::from_secs(5);
 static LOGO_PNG: &[u8] = include_bytes!("../../assets/logo.png");
@@ -83,6 +88,9 @@ pub(crate) struct GuiApp {
     dialog: Option<(usize, Dialog)>,
     mouse_pane: Option<String>,
     scroll_remainder: f32,
+    /// `[ui] mouse_scroll_lines`: lines per mouse wheel notch, as in the terminal app.
+    scroll_lines: f32,
+    resize: ResizeThrottle,
 }
 
 impl GuiApp {
@@ -161,6 +169,8 @@ impl GuiApp {
             dialog: None,
             mouse_pane: None,
             scroll_remainder: 0.0,
+            scroll_lines: crate::config::Config::load().config.ui.mouse_scroll_lines() as f32,
+            resize: ResizeThrottle::default(),
         };
         app.reload_theme();
         cx.observe_window_appearance(window, |this, window, cx| {
@@ -317,12 +327,22 @@ impl GuiApp {
                     negotiation,
                 } => {
                     self.hosts[index].connected(transport, negotiation);
+                    self.run_limits_task(index, None, cx);
                     if index == self.selected {
                         self.send_resize(index);
                     }
                 }
                 ConnectionEvent::Message(message) => {
                     let effects = self.hosts[index].apply(*message);
+                    if index == self.selected {
+                        let size = self.hosts[index]
+                            .surface
+                            .as_ref()
+                            .map(|surface| (surface.frame.width, surface.frame.height));
+                        if size.is_some_and(|size| self.resize.answered(size)) {
+                            self.flush_resize(cx);
+                        }
+                    }
                     if let Some(text) = effects.clipboard {
                         cx.write_to_clipboard(ClipboardItem::new_string(text));
                     }
@@ -443,8 +463,37 @@ impl GuiApp {
             return;
         }
         self.grid = (cols, rows);
-        self.send_resize(self.selected);
+        self.resize.pending = true;
+        self.flush_resize(cx);
         cx.notify();
+    }
+
+    /// Sends the latest size when the throttle allows it, otherwise schedules a retry.
+    /// Every resize makes the server re-lay out and redraw every pane, so sending one per
+    /// frame while dragging floods slow (SSH) connections with full-screen frames.
+    fn flush_resize(&mut self, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        match self.resize.ready_at(now) {
+            None => {}
+            Some(at) if at <= now => {
+                self.resize.sent(now, self.grid);
+                self.send_resize(self.selected);
+            }
+            Some(at) => {
+                if self.resize.retry_scheduled {
+                    return;
+                }
+                self.resize.retry_scheduled = true;
+                cx.spawn(async move |this, cx| {
+                    Timer::after(at.saturating_duration_since(Instant::now())).await;
+                    let _ = this.update(cx, |this, cx| {
+                        this.resize.retry_scheduled = false;
+                        this.flush_resize(cx);
+                    });
+                })
+                .detach();
+            }
+        }
     }
 
     fn request(&mut self, method: &str, params: serde_json::Value) {
@@ -679,7 +728,7 @@ impl GuiApp {
             return;
         };
         let lines = match event.delta {
-            ScrollDelta::Lines(delta) => delta.y,
+            ScrollDelta::Lines(delta) => delta.y * self.scroll_lines,
             ScrollDelta::Pixels(delta) => delta.y / metrics.line_height,
         } + self.scroll_remainder;
         let whole = lines.trunc();
@@ -1453,6 +1502,45 @@ impl GuiApp {
 
 // ----- rendering -------------------------------------------------------------
 
+/// Throttles terminal resizes: at most one per `RESIZE_INTERVAL`, and none while the
+/// previous one is unanswered (up to `RESIZE_REPLY_TIMEOUT`). The final size always goes out.
+#[derive(Default)]
+struct ResizeThrottle {
+    pending: bool,
+    retry_scheduled: bool,
+    sent_at: Option<Instant>,
+    awaiting: Option<(u16, u16)>,
+}
+
+impl ResizeThrottle {
+    /// When the pending size may be sent, or `None` when nothing is pending.
+    fn ready_at(&self, now: Instant) -> Option<Instant> {
+        if !self.pending {
+            return None;
+        }
+        Some(match self.sent_at {
+            None => now,
+            Some(sent) if self.awaiting.is_some() => sent + RESIZE_REPLY_TIMEOUT,
+            Some(sent) => sent + RESIZE_INTERVAL,
+        })
+    }
+
+    fn sent(&mut self, now: Instant, size: (u16, u16)) {
+        self.pending = false;
+        self.sent_at = Some(now);
+        self.awaiting = Some(size);
+    }
+
+    /// Records a surface of `size`; true when it answers the resize in flight.
+    fn answered(&mut self, size: (u16, u16)) -> bool {
+        if self.awaiting == Some(size) {
+            self.awaiting = None;
+            return true;
+        }
+        false
+    }
+}
+
 fn is_dark(appearance: gpui::WindowAppearance) -> bool {
     matches!(
         appearance,
@@ -1811,6 +1899,7 @@ impl GuiApp {
                 )
                 .child(usage_view::render(
                     self.usage.get(&self.selected_host().id),
+                    self.claude_limits.get(&self.selected_host().id),
                     &self.usage_expanded,
                     theme,
                     cx,
@@ -2258,5 +2347,30 @@ impl Render for GuiApp {
             .when_some(form, |root, form| root.child(form))
             .when_some(dialog, |root, dialog| root.child(dialog))
             .when_some(context_menu, |root, menu| root.child(menu))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resizes_wait_for_the_previous_answer_and_the_interval() {
+        let start = Instant::now();
+        let mut throttle = ResizeThrottle::default();
+        assert_eq!(throttle.ready_at(start), None);
+
+        throttle.pending = true;
+        assert_eq!(throttle.ready_at(start), Some(start));
+        throttle.sent(start, (100, 40));
+
+        // A newer size waits for the server's answer, up to the timeout.
+        throttle.pending = true;
+        assert_eq!(throttle.ready_at(start), Some(start + RESIZE_REPLY_TIMEOUT));
+
+        // Only an answer at the requested size counts.
+        assert!(!throttle.answered((90, 40)));
+        assert!(throttle.answered((100, 40)));
+        assert_eq!(throttle.ready_at(start), Some(start + RESIZE_INTERVAL));
     }
 }

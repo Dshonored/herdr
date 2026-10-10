@@ -133,6 +133,8 @@ pub(crate) struct AgentUsage {
 pub(crate) struct UsageReport {
     pub(crate) agents: Vec<(AgentKind, AgentUsage)>,
     pub(crate) generated_at: i64,
+    /// The saved Claude Code status line input, when limit capture has written one.
+    pub(crate) claude_capture: Option<super::claude_limits::CaptureInfo>,
 }
 
 // ----- field extraction ------------------------------------------------------
@@ -400,6 +402,7 @@ impl Collected {
         UsageReport {
             agents,
             generated_at: now,
+            claude_capture: None,
         }
     }
 }
@@ -530,14 +533,22 @@ impl LocalScanner {
         }
         self.files.retain(|path, _| live.contains(path));
         let now = now();
-        if let Some(limits) = local_claude_limits(now) {
+        let capture = local_claude_capture();
+        if let Some(limits) = capture
+            .as_ref()
+            .and_then(|(at, text)| super::claude_limits::parse_capture(text, *at, now))
+        {
             collected.push(Parsed::Limits(AgentKind::ClaudeCode, limits));
         }
-        collected.report(now)
+        let mut report = collected.report(now);
+        report.claude_capture =
+            capture.and_then(|(at, text)| super::claude_limits::capture_info(&text, at));
+        report
     }
 }
 
-fn local_claude_limits(now: i64) -> Option<PlanLimits> {
+/// The saved status line input and when it was written.
+fn local_claude_capture() -> Option<(i64, String)> {
     let path = super::claude_limits::local_capture_path()?;
     let captured_at = std::fs::metadata(&path)
         .and_then(|metadata| metadata.modified())
@@ -545,8 +556,7 @@ fn local_claude_limits(now: i64) -> Option<PlanLimits> {
         .duration_since(UNIX_EPOCH)
         .ok()?
         .as_secs() as i64;
-    let text = std::fs::read_to_string(&path).ok()?;
-    super::claude_limits::parse_capture(&text, captured_at, now)
+    Some((captured_at, std::fs::read_to_string(&path).ok()?))
 }
 
 fn parse_file(agent: AgentKind, path: &Path) -> io::Result<Vec<ParsedOwned>> {
@@ -631,12 +641,16 @@ pub(crate) fn parse_remote_output(output: &str, now: i64) -> UsageReport {
         }
     }
     flush(agent, &mut line, &mut state);
-    if let Some(limits) =
-        claude_capture.and_then(|(at, text)| super::claude_limits::parse_capture(&text, at, now))
+    if let Some(limits) = claude_capture
+        .as_ref()
+        .and_then(|(at, text)| super::claude_limits::parse_capture(text, *at, now))
     {
         collected.push(Parsed::Limits(AgentKind::ClaudeCode, limits));
     }
-    collected.report(now)
+    let mut report = collected.report(now);
+    report.claude_capture =
+        claude_capture.and_then(|(at, text)| super::claude_limits::capture_info(&text, at));
+    report
 }
 
 /// Runs the usage script on a saved SSH machine.
@@ -844,6 +858,7 @@ mod tests {
             r#"{"rate_limits":{"five_hour":{"used_percentage":23.5,"resets_at":1791600000},"seven_day":{"used_percentage":41.2,"resets_at":1792000000}}}"#
         );
         let report = parse_remote_output(&output, NOW);
+        assert_eq!(report.claude_capture.as_ref().map(|c| c.at), Some(NOW - 60));
         let limits = report.agents[0].1.limits.as_ref().unwrap();
         assert_eq!(report.agents[0].0, AgentKind::ClaudeCode);
         assert_eq!(limits.at, NOW - 60);

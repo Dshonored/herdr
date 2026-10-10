@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=herdr
+GenericName=Agent terminal
+Comment=Terminal workspaces for coding agents
+Exec="@EXEC@" gui
+Icon=herdr-desktop
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;agents;ssh;claude;codex;
+StartupWMClass=herdr-desktop

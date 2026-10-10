@@ -50,9 +50,9 @@ pub(crate) fn releases_page() -> String {
 pub(crate) fn asset_name() -> Option<&'static str> {
     Some(match (std::env::consts::OS, std::env::consts::ARCH) {
         ("windows", "x86_64") => "herdr-desktop-windows-x86_64.zip",
-        ("macos", "aarch64") => "herdr-desktop-macos-aarch64",
-        ("macos", "x86_64") => "herdr-desktop-macos-x86_64",
-        ("linux", "x86_64") => "herdr-desktop-linux-x86_64",
+        ("macos", "aarch64") => "herdr-desktop-macos-aarch64.zip",
+        ("macos", "x86_64") => "herdr-desktop-macos-x86_64.zip",
+        ("linux", "x86_64") => "herdr-desktop-linux-x86_64.tar.gz",
         _ => return None,
     })
 }
@@ -142,12 +142,33 @@ pub(crate) fn is_newer(release: &Release) -> bool {
     current_version().is_none_or(|current| release.version > current)
 }
 
+/// What an update replaces: the `.app` bundle when running from one (any name, as the
+/// user may have renamed it), otherwise the folder holding the executable.
+fn install_root_for(exe: &Path) -> Option<PathBuf> {
+    let parent = exe.parent()?;
+    let bundle = parent
+        .ancestors()
+        .find(|dir| dir.extension().is_some_and(|ext| ext == "app"));
+    Some(bundle.unwrap_or(parent).to_path_buf())
+}
+
 fn install_dir() -> Result<PathBuf, String> {
     let exe =
         std::env::current_exe().map_err(|error| format!("can't find this program: {error}"))?;
-    exe.parent()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| "can't find the install folder".into())
+    install_root_for(&exe).ok_or_else(|| "can't find the install folder".into())
+}
+
+/// The folder whose contents map onto the install root. Archives that wrap the app in one
+/// folder (`herdr.app` on macOS, `herdr-desktop` on Linux) map that folder; the Windows
+/// zip maps everything unpacked.
+fn staged_root(unpacked: &Path) -> std::io::Result<PathBuf> {
+    let entries: Vec<_> = std::fs::read_dir(unpacked)?.collect::<Result<_, _>>()?;
+    if let [entry] = entries.as_slice() {
+        if entry.file_type()?.is_dir() {
+            return Ok(entry.path());
+        }
+    }
+    Ok(unpacked.to_path_buf())
 }
 
 /// Files ready to replace the installed ones.
@@ -155,6 +176,7 @@ fn install_dir() -> Result<PathBuf, String> {
 pub(crate) struct StagedUpdate {
     pub(crate) release: Release,
     dir: PathBuf,
+    root: PathBuf,
 }
 
 fn expected_checksum(sums: &str, asset: &str) -> Option<String> {
@@ -190,12 +212,29 @@ pub(crate) fn download(release: &Release) -> Result<StagedUpdate, String> {
 
     let files = dir.join("files");
     std::fs::create_dir_all(&files).map_err(|e| e.to_string())?;
-    if asset.ends_with(".zip") {
-        let status = std::process::Command::new(zip_tar())
-            .arg("-xf")
+    if asset.ends_with(".tar.gz") {
+        let status = std::process::Command::new("tar")
+            .arg("-xzf")
             .arg(&download)
             .arg("-C")
             .arg(&files)
+            .status()
+            .map_err(|error| format!("could not unpack the update: {error}"))?;
+        if !status.success() {
+            return Err("could not unpack the update".into());
+        }
+    } else if asset.ends_with(".zip") {
+        let mut unpack = if Path::new(DITTO).is_file() {
+            // ditto keeps a macOS bundle's permissions and symlinks.
+            let mut command = std::process::Command::new(DITTO);
+            command.arg("-x").arg("-k").arg(&download).arg(&files);
+            command
+        } else {
+            let mut command = std::process::Command::new(zip_tar());
+            command.arg("-xf").arg(&download).arg("-C").arg(&files);
+            command
+        };
+        let status = unpack
             .status()
             .map_err(|error| format!("could not unpack the update: {error}"))?;
         if !status.success() {
@@ -215,11 +254,15 @@ pub(crate) fn download(release: &Release) -> Result<StagedUpdate, String> {
                 .map_err(|e| e.to_string())?;
         }
     }
+    let root = staged_root(&files).map_err(|e| e.to_string())?;
     Ok(StagedUpdate {
         release: release.clone(),
         dir,
+        root,
     })
 }
+
+const DITTO: &str = "/usr/bin/ditto";
 
 /// Windows' bundled bsdtar (Windows 10 and later) reads zip archives. Name it by path:
 /// a `tar` earlier on PATH, such as Git Bash's GNU tar, cannot.
@@ -246,7 +289,7 @@ fn staged_files(root: &Path, relative: &Path, out: &mut Vec<PathBuf>) -> std::io
 /// Moves the staged files over the installed ones. Running files are renamed aside.
 pub(crate) fn install(staged: &StagedUpdate) -> Result<(), String> {
     let install = install_dir()?;
-    install_into(&install, &staged.dir.join("files"))?;
+    install_into(&install, &staged.root)?;
     let _ = std::fs::remove_dir_all(install.join(STAGING_DIR));
     Ok(())
 }
@@ -306,7 +349,13 @@ pub(crate) fn cleanup_previous_update() {
         for entry in entries.flatten() {
             let path = entry.path();
             if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                if path.file_name().is_some_and(|name| name == "conpty") {
+                let known = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        matches!(name, "conpty" | "Contents" | "MacOS" | "Resources")
+                    });
+                if known {
                     stack.push(path);
                 }
             } else if path
@@ -366,6 +415,32 @@ mod tests {
         .unwrap();
         assert_eq!(picked.tag, "desktop-v0.2.0");
         assert!(picked.checksums_url.is_some());
+    }
+
+    #[test]
+    fn updates_replace_the_app_bundle_or_the_executable_folder() {
+        let bundle = Path::new("/Applications/My herdr.app/Contents/MacOS/herdr");
+        assert_eq!(
+            install_root_for(bundle).unwrap(),
+            PathBuf::from("/Applications/My herdr.app")
+        );
+        let plain = Path::new("/opt/herdr/herdr");
+        assert_eq!(
+            install_root_for(plain).unwrap(),
+            PathBuf::from("/opt/herdr")
+        );
+    }
+
+    #[test]
+    fn a_single_unpacked_bundle_is_the_staged_root() {
+        let root = std::env::temp_dir().join(format!("herdr-staged-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("herdr.app").join("Contents")).unwrap();
+        assert_eq!(staged_root(&root).unwrap(), root.join("herdr.app"));
+        // A Windows zip unpacks several entries and maps as a whole.
+        std::fs::write(root.join("README"), "").unwrap();
+        assert_eq!(staged_root(&root).unwrap(), root);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -35,6 +35,8 @@ pub(crate) fn run() -> io::Result<()> {
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(720.0), px(460.0))),
+                // Matches StartupWMClass in the Linux launcher entry, so docks show its icon.
+                app_id: Some("herdr-desktop".into()),
                 titlebar: Some(gpui::TitlebarOptions {
                     title: Some("herdr".into()),
                     ..Default::default()

@@ -148,6 +148,24 @@ pub(crate) fn uninstall(settings: &str, original: &Value) -> Result<String, Stri
     Ok(root.to_string())
 }
 
+/// What the latest saved status line input says about the Claude Code that wrote it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CaptureInfo {
+    pub(crate) version: Option<String>,
+    pub(crate) at: i64,
+}
+
+pub(crate) fn capture_info(text: &str, captured_at: i64) -> Option<CaptureInfo> {
+    let value: Value = serde_json::from_str(text.trim()).ok()?;
+    Some(CaptureInfo {
+        version: value
+            .get("version")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        at: captured_at,
+    })
+}
+
 /// Reads plan limits from a saved status line input.
 pub(crate) fn parse_capture(text: &str, captured_at: i64, now: i64) -> Option<PlanLimits> {
     let value: Value = serde_json::from_str(text.trim()).ok()?;
