@@ -71,6 +71,11 @@ pub(crate) struct GuiApp {
     update_next: Instant,
     /// This computer's `[ui] max_fps`, read when settings open.
     local_max_fps: Option<u16>,
+    /// Resolved herdr theme name, e.g. `tokyo-night`.
+    theme_name: String,
+    /// `[theme] auto_switch`: follow the system light/dark appearance.
+    theme_auto: bool,
+    dark_appearance: bool,
     usage_next: Instant,
     local_usage: Arc<Mutex<LocalScanner>>,
     logo: Arc<gpui::Image>,
@@ -144,6 +149,9 @@ impl GuiApp {
             update_status: UpdateStatus::Idle,
             update_next: Instant::now() + FIRST_UPDATE_CHECK,
             local_max_fps: None,
+            theme_name: String::new(),
+            theme_auto: false,
+            dark_appearance: is_dark(window.appearance()),
             usage_next: Instant::now(),
             local_usage: Arc::new(Mutex::new(LocalScanner::default())),
             logo: Arc::new(gpui::Image::from_bytes(
@@ -154,10 +162,71 @@ impl GuiApp {
             mouse_pane: None,
             scroll_remainder: 0.0,
         };
+        app.reload_theme();
+        cx.observe_window_appearance(window, |this, window, cx| {
+            this.dark_appearance = is_dark(window.appearance());
+            this.reload_theme();
+            cx.notify();
+        })
+        .detach();
         for index in 0..app.hosts.len() {
             app.connect(index);
         }
         app
+    }
+
+    /// Applies this computer's herdr `[theme]` for the current system appearance.
+    fn reload_theme(&mut self) {
+        let config = crate::config::Config::load().config;
+        let (palette, name) = crate::app::desktop_palette(&config, self.dark_appearance);
+        self.theme = Theme::from_palette(&palette, self.dark_appearance);
+        self.theme_name = name;
+        self.theme_auto = config.theme.auto_switch;
+    }
+
+    /// Writes one `config.toml` value, then reloads the theme and the local server.
+    fn change_config(
+        &mut self,
+        table: &'static str,
+        key: &'static str,
+        value: toml_edit::Value,
+        done: String,
+        cx: &mut Context<Self>,
+    ) {
+        let task = cx
+            .background_executor()
+            .spawn(async move { super::config_file::set(table, key, value) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => {
+                        this.reload_theme();
+                        this.local_max_fps = Some(crate::config::Config::load().config.ui.max_fps);
+                        if this.hosts[0].is_online() {
+                            this.hosts[0].request("server.reload_config", serde_json::json!({}));
+                        }
+                        this.show_notice(done);
+                    }
+                    Err(error) => this.show_notice(format!("could not save settings: {error}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn set_theme(&mut self, name: &'static str, cx: &mut Context<Self>) {
+        self.change_config("theme", "name", name.into(), format!("Theme: {name}"), cx);
+    }
+
+    pub(crate) fn set_theme_auto(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let done = if enabled {
+            "Theme follows the system light/dark setting"
+        } else {
+            "Theme no longer follows the system light/dark setting"
+        };
+        self.change_config("theme", "auto_switch", enabled.into(), done.into(), cx);
     }
 
     fn listen(mut receiver: UnboundedReceiver<HostEvent>, cx: &mut Context<Self>) {
@@ -774,26 +843,13 @@ impl GuiApp {
     // ----- frame rate ----------------------------------------------------------
 
     pub(crate) fn set_frame_rate(&mut self, fps: u16, cx: &mut Context<Self>) {
-        let task = cx
-            .background_executor()
-            .spawn(async move { updater::set_local_max_fps(fps) });
-        cx.spawn(async move |this, cx| {
-            let result = task.await;
-            let _ = this.update(cx, |this, cx| {
-                match result {
-                    Ok(()) => {
-                        this.local_max_fps = Some(fps);
-                        if this.hosts[0].is_online() {
-                            this.hosts[0].request("server.reload_config", serde_json::json!({}));
-                        }
-                        this.show_notice(format!("Terminal frame rate set to {fps} fps"));
-                    }
-                    Err(error) => this.show_notice(format!("could not set frame rate: {error}")),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+        self.change_config(
+            "ui",
+            "max_fps",
+            i64::from(fps).into(),
+            format!("Terminal frame rate set to {fps} fps"),
+            cx,
+        );
     }
 
     // ----- updates -------------------------------------------------------------
@@ -1396,6 +1452,13 @@ impl GuiApp {
 }
 
 // ----- rendering -------------------------------------------------------------
+
+fn is_dark(appearance: gpui::WindowAppearance) -> bool {
+    matches!(
+        appearance,
+        gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
+    )
+}
 
 fn dot(color: Hsla) -> impl IntoElement {
     div().size(px(8.0)).rounded_full().bg(color).flex_none()
@@ -2138,6 +2201,9 @@ impl Render for GuiApp {
                     prefs: &self.prefs,
                     update: self.update_view(),
                     max_fps: self.local_max_fps,
+                    theme_name: &self.theme_name,
+                    theme_auto: self.theme_auto,
+                    dark: self.dark_appearance,
                 },
                 &self.settings_focus,
                 &theme,

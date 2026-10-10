@@ -330,29 +330,6 @@ pub(crate) fn relaunch() -> Result<(), String> {
         .map_err(|error| format!("could not restart: {error}"))
 }
 
-/// Sets `[ui] max_fps` in this computer's herdr config, keeping comments and layout.
-pub(crate) fn set_local_max_fps(fps: u16) -> Result<(), String> {
-    let path = crate::config::config_path();
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(error.to_string()),
-    };
-    let mut document: toml_edit::DocumentMut = text
-        .parse()
-        .map_err(|error| format!("{} is not valid TOML: {error}", path.display()))?;
-    let ui = document
-        .entry("ui")
-        .or_insert(toml_edit::table())
-        .as_table_mut()
-        .ok_or("[ui] in config.toml is not a table")?;
-    ui["max_fps"] = toml_edit::value(i64::from(fps));
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    std::fs::write(&path, document.to_string()).map_err(|e| e.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

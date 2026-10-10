@@ -7,6 +7,7 @@
 
 mod app;
 mod claude_limits;
+mod config_file;
 mod connection;
 mod dialog;
 mod host;

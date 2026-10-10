@@ -69,6 +69,9 @@ pub(crate) struct SettingsView<'a> {
     pub(crate) update: UpdateView,
     /// This computer's server `[ui] max_fps`, when known.
     pub(crate) max_fps: Option<u16>,
+    pub(crate) theme_name: &'a str,
+    pub(crate) theme_auto: bool,
+    pub(crate) dark: bool,
 }
 
 fn button(id: impl Into<gpui::ElementId>, label: &str, theme: &Theme) -> gpui::Stateful<gpui::Div> {
@@ -438,6 +441,79 @@ fn updates(view: &SettingsView<'_>, theme: &Theme, cx: &mut Context<GuiApp>) -> 
         )
 }
 
+fn themes(view: &SettingsView<'_>, theme: &Theme, cx: &mut Context<GuiApp>) -> gpui::Div {
+    let mut grid = div().flex().flex_wrap().gap(px(8.0));
+    for (index, name) in crate::config::THEME_NAMES.iter().copied().enumerate() {
+        let Some(palette) = crate::app::state::Palette::from_name(name) else {
+            continue;
+        };
+        let preview = Theme::from_palette(&palette, view.dark);
+        let active = name == view.theme_name;
+        let mut swatches = div().flex().gap(px(3.0));
+        for color in preview.swatch() {
+            swatches = swatches.child(
+                div()
+                    .size(px(12.0))
+                    .rounded(px(3.0))
+                    .bg(color)
+                    .border_1()
+                    .border_color(preview.border),
+            );
+        }
+        grid = grid.child(
+            div()
+                .id(("theme", index))
+                .w(px(168.0))
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .p(px(8.0))
+                .rounded(px(8.0))
+                .cursor_pointer()
+                .bg(preview.panel_bg)
+                .text_color(preview.text)
+                .border_1()
+                .border_color(if active { theme.accent } else { preview.border })
+                .when(active, |card| card.border_2())
+                .hover(|style| style.border_color(theme.accent))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.set_theme(name, cx);
+                    cx.notify();
+                }))
+                .child(div().text_sm().truncate().child(name))
+                .child(swatches),
+        );
+    }
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .child(div().text_sm().child("Theme"))
+        .child(
+            div()
+                .text_xs()
+                .text_color(theme.text_muted)
+                .child("herdr's built-in themes, shared with the terminal app through config.toml. Custom [theme.custom] colors still apply."),
+        )
+        .child(grid)
+        .child(
+            toggle(
+                "theme-auto",
+                "Follow system light/dark",
+                "Switches between the light and dark variant of the theme with your system setting.",
+                view.theme_auto,
+                theme,
+            )
+            .on_click({
+                let enabled = !view.theme_auto;
+                cx.listener(move |this, _, _, cx| {
+                    this.set_theme_auto(enabled, cx);
+                    cx.notify();
+                })
+            }),
+        )
+}
+
 fn appearance(view: &SettingsView<'_>, theme: &Theme, cx: &mut Context<GuiApp>) -> gpui::Div {
     let size = view.prefs.font_size;
     let mut rates = div()
@@ -471,30 +547,36 @@ fn appearance(view: &SettingsView<'_>, theme: &Theme, cx: &mut Context<GuiApp>) 
                 })),
         );
     }
-    div().flex().flex_col().gap(px(14.0)).child(rates).child(
-        div()
-            .flex()
-            .items_center()
-            .gap(px(10.0))
-            .child(div().flex_1().text_sm().child("Terminal font size"))
-            .child(
-                button("font-smaller", "−", theme).on_click(cx.listener(|this, _, _, cx| {
-                    this.update_prefs(|prefs| {
-                        prefs.font_size = (prefs.font_size - 1.0).max(MIN_FONT_SIZE);
-                    });
-                    cx.notify();
-                })),
-            )
-            .child(div().w(px(36.0)).text_center().child(format!("{size:.0}")))
-            .child(
-                button("font-larger", "+", theme).on_click(cx.listener(|this, _, _, cx| {
-                    this.update_prefs(|prefs| {
-                        prefs.font_size = (prefs.font_size + 1.0).min(MAX_FONT_SIZE);
-                    });
-                    cx.notify();
-                })),
-            ),
-    )
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(14.0))
+        .child(themes(view, theme, cx))
+        .child(rates)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(10.0))
+                .child(div().flex_1().text_sm().child("Terminal font size"))
+                .child(button("font-smaller", "−", theme).on_click(cx.listener(
+                    |this, _, _, cx| {
+                        this.update_prefs(|prefs| {
+                            prefs.font_size = (prefs.font_size - 1.0).max(MIN_FONT_SIZE);
+                        });
+                        cx.notify();
+                    },
+                )))
+                .child(div().w(px(36.0)).text_center().child(format!("{size:.0}")))
+                .child(button("font-larger", "+", theme).on_click(cx.listener(
+                    |this, _, _, cx| {
+                        this.update_prefs(|prefs| {
+                            prefs.font_size = (prefs.font_size + 1.0).min(MAX_FONT_SIZE);
+                        });
+                        cx.notify();
+                    },
+                ))),
+        )
 }
 
 pub(crate) fn render(

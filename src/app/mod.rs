@@ -362,6 +362,18 @@ fn resolve_effective_theme(
     )
 }
 
+/// Palette and theme name the desktop app shows for `config` in a light or dark system theme,
+/// resolved exactly as the terminal client resolves them.
+#[cfg(feature = "gui")]
+pub(crate) fn desktop_palette(config: &Config, dark: bool) -> (state::Palette, String) {
+    let appearance = if dark {
+        crate::terminal_theme::HostAppearance::Dark
+    } else {
+        crate::terminal_theme::HostAppearance::Light
+    };
+    resolve_effective_theme(&theme_runtime_config(config, true), Some(appearance))
+}
+
 pub(crate) fn client_theme_runtime_from_config(config: &Config) -> state::ThemeRuntimeConfig {
     theme_runtime_config(config, true)
 }
