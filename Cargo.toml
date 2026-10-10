@@ -67,6 +67,8 @@ gui = ["dep:gpui", "dep:futures", "dep:toml_edit"]
 
 [patch.crates-io]
 portable-pty = { path = "vendor/portable-pty" }
+# Linux build fix for the desktop app's dependency chain; see vendor/xattr/HERDR_PATCH.md.
+xattr = { path = "vendor/xattr" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # logind's delay inhibitor lets the server save before host shutdown kills panes.
