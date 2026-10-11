@@ -11,9 +11,10 @@ use std::time::{Duration, Instant};
 use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures::StreamExt as _;
 use gpui::{
-    canvas, div, prelude::*, px, AnyElement, ClickEvent, ClipboardItem, Context, FocusHandle, Hsla,
-    KeyDownEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Pixels, Point, ScrollDelta, ScrollWheelEvent, SharedString, Timer, Window,
+    canvas, div, prelude::*, px, Animation, AnimationExt, AnyElement, ClickEvent, ClipboardItem,
+    Context, DragMoveEvent, FocusHandle, Hsla, KeyDownEvent, ModifiersChangedEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta, ScrollWheelEvent,
+    SharedString, Timer, Window,
 };
 use tracing::warn;
 
@@ -65,7 +66,11 @@ struct DragPreview {
 
 impl Render for DragPreview {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        // Lifts out of its slot: fades in while settling 4px up, then follows the pointer.
         div()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
             .px(px(10.0))
             .py(px(4.0))
             .rounded(px(6.0))
@@ -74,7 +79,14 @@ impl Render for DragPreview {
             .text_color(self.fg)
             .border_1()
             .border_color(self.border)
+            .shadow_lg()
+            .child(div().text_xs().opacity(0.6).child("⋮⋮"))
             .child(self.label.clone())
+            .with_animation(
+                "drag-preview",
+                Animation::new(Duration::from_millis(150)).with_easing(gpui::ease_out_quint()),
+                |preview, t| preview.opacity(0.95 * t).mt(px(4.0 * (1.0 - t))),
+            )
     }
 }
 
@@ -116,14 +128,31 @@ fn tab_shortcut_label(index: usize, count: usize) -> Option<String> {
     Some(format!("{prefix}{number}"))
 }
 
-/// `tab.move` inserts before `insert_index`, counted before the moved tab is removed, so
-/// dropping onto a tab to its right inserts after that tab.
-fn tab_insert_index(from: usize, onto: usize) -> Option<usize> {
-    match from.cmp(&onto) {
-        std::cmp::Ordering::Equal => None,
-        std::cmp::Ordering::Less => Some(onto + 1),
-        std::cmp::Ordering::Greater => Some(onto),
-    }
+/// The `tab.move` index for dropping tab `from` on the left or right half of tab `onto`.
+/// `tab.move` inserts before the index, counted before the moved tab is removed; `None`
+/// when the drop would leave the tab where it is.
+fn tab_insert_index(from: usize, onto: usize, after: bool) -> Option<usize> {
+    let insert = onto + usize::from(after);
+    (insert != from && insert != from + 1).then_some(insert)
+}
+
+/// Where the current tab or pane drag will land, drawn while dragging.
+#[derive(Clone, Debug, PartialEq)]
+enum DragTarget {
+    Tab {
+        from: usize,
+        onto: usize,
+        after: bool,
+    },
+    Pane {
+        source: String,
+        target: Option<String>,
+    },
+}
+
+/// Drop indicators fade in quickly with a strong ease-out so they track the pointer.
+fn landing_fade() -> Animation {
+    Animation::new(Duration::from_millis(120)).with_easing(gpui::ease_out_quint())
 }
 
 /// The grip at the top centre of a pane, relative to the terminal's origin.
@@ -189,6 +218,7 @@ pub(crate) struct GuiApp {
     stats_loading: bool,
     /// The sidebar edge is being dragged.
     sidebar_dragging: bool,
+    drag_target: Option<DragTarget>,
     logo: Arc<gpui::Image>,
     /// Open dialog and the machine its action applies to.
     dialog: Option<(usize, Dialog)>,
@@ -276,6 +306,7 @@ impl GuiApp {
             stats_next: Instant::now(),
             stats_loading: false,
             sidebar_dragging: false,
+            drag_target: None,
             logo: Arc::new(gpui::Image::from_bytes(
                 gpui::ImageFormat::Png,
                 LOGO_PNG.to_vec(),
@@ -672,7 +703,11 @@ impl GuiApp {
 
     /// Moves a dragged tab to where another tab sits.
     fn drop_tab(&mut self, dragged: &DraggedTab, target: usize) {
-        let Some(insert_index) = tab_insert_index(dragged.index, target) else {
+        let after = matches!(
+            self.drag_target.take(),
+            Some(DragTarget::Tab { onto, after: true, .. }) if onto == target
+        );
+        let Some(insert_index) = tab_insert_index(dragged.index, target, after) else {
             return;
         };
         self.request(
@@ -696,16 +731,22 @@ impl GuiApp {
     }
 
     /// Swaps a dragged pane with the pane under the pointer.
+    fn pane_id_at(&self, position: Point<Pixels>) -> Option<String> {
+        let (col, row) = self.mouse_cell(position)?;
+        let surface = self.selected_host().surface.as_ref()?;
+        terminal::pane_at(&surface.panes, col, row).map(|pane| pane.pane_id.clone())
+    }
+
+    fn set_drag_target(&mut self, target: Option<DragTarget>, cx: &mut Context<Self>) {
+        if self.drag_target != target {
+            self.drag_target = target;
+            cx.notify();
+        }
+    }
+
     fn drop_pane(&mut self, dragged: &DraggedPane, position: Point<Pixels>) {
-        let Some((col, row)) = self.mouse_cell(position) else {
-            return;
-        };
-        let target = self
-            .selected_host()
-            .surface
-            .as_ref()
-            .and_then(|surface| terminal::pane_at(&surface.panes, col, row))
-            .map(|pane| pane.pane_id.clone());
+        self.drag_target = None;
+        let target = self.pane_id_at(position);
         if let Some(target) = target.filter(|target| *target != dragged.pane_id) {
             self.request(
                 "pane.swap",
@@ -2436,6 +2477,7 @@ impl GuiApp {
             .min_w_0()
             .items_center()
             .gap(px(4.0))
+            .px(px(3.0))
             .overflow_hidden();
         if let Some(snapshot) = &self.selected_host().snapshot {
             let workspace_id = snapshot.focused_workspace_id.clone();
@@ -2450,7 +2492,15 @@ impl GuiApp {
                 .filter(|tab| Some(&tab.workspace_id) == workspace_id.as_ref())
                 .enumerate()
             {
-                let drop_highlight = theme.hover;
+                let landing = match &self.drag_target {
+                    Some(DragTarget::Tab { from, onto, after })
+                        if *onto == index && tab_insert_index(*from, *onto, *after).is_some() =>
+                    {
+                        Some(*after)
+                    }
+                    _ => None,
+                };
+                let lifted = matches!(&self.drag_target, Some(DragTarget::Tab { from, .. }) if *from == index);
                 let preview_label = tab.label.clone();
                 let preview_theme = theme.clone();
                 let grip = div()
@@ -2476,6 +2526,7 @@ impl GuiApp {
                 tabs = tabs.child(
                     div()
                         .id(("tab", index))
+                        .relative()
                         .flex_shrink_0()
                         .max_w(px(220.0))
                         .on_mouse_down(
@@ -2506,7 +2557,39 @@ impl GuiApp {
                         .hover(|style| style.bg(theme.hover))
                         .when(tab.focused, |tab| tab.bg(theme.selected))
                         .when(!tab.focused, |tab| tab.text_color(theme.text_muted))
-                        .drag_over::<DraggedTab>(move |style, _, _, _| style.bg(drop_highlight))
+                        .when(lifted, |tab| tab.opacity(0.35))
+                        .on_drag_move(cx.listener(
+                            move |this, event: &DragMoveEvent<DraggedTab>, _, cx| {
+                                let position = event.event.position;
+                                if !event.bounds.contains(&position) {
+                                    return;
+                                }
+                                let target = DragTarget::Tab {
+                                    from: event.drag(cx).index,
+                                    onto: index,
+                                    after: position.x > event.bounds.center().x,
+                                };
+                                this.set_drag_target(Some(target), cx);
+                            },
+                        ))
+                        .when_some(landing, |tab, after| {
+                            tab.child(
+                                div()
+                                    .absolute()
+                                    .top(px(2.0))
+                                    .bottom(px(2.0))
+                                    .w(px(2.0))
+                                    .rounded_full()
+                                    .bg(theme.accent)
+                                    .when(after, |bar| bar.right(px(-3.0)))
+                                    .when(!after, |bar| bar.left(px(-3.0)))
+                                    .with_animation(
+                                        SharedString::from(format!("tab-landing-{index}-{after}")),
+                                        landing_fade(),
+                                        |bar, t| bar.opacity(t),
+                                    ),
+                            )
+                        })
                         .on_drop(cx.listener(move |this, dragged: &DraggedTab, _, cx| {
                             this.drop_tab(dragged, index);
                             cx.notify();
@@ -2613,6 +2696,63 @@ impl GuiApp {
         let selection = self.selection.clone();
         let entity = cx.entity().downgrade();
         let window_active = window.is_window_active();
+
+        // While a pane is dragged: the source looks lifted, the target is outlined.
+        let mut pane_overlays: Vec<AnyElement> = Vec::new();
+        if let (Some(DragTarget::Pane { source, target }), Some(surface), Some(metrics)) =
+            (&self.drag_target, &surface, &metrics)
+        {
+            for pane in &surface.panes {
+                let is_target = target.as_ref() == Some(&pane.pane_id);
+                if pane.pane_id != *source && !is_target {
+                    continue;
+                }
+                let overlay = div()
+                    .absolute()
+                    .left(metrics.cell_width * f32::from(pane.rect.x))
+                    .top(metrics.line_height * f32::from(pane.rect.y))
+                    .w(metrics.cell_width * f32::from(pane.rect.width))
+                    .h(metrics.line_height * f32::from(pane.rect.height));
+                pane_overlays.push(if is_target {
+                    overlay
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(4.0))
+                        .border_2()
+                        .border_color(theme.accent)
+                        .bg(Hsla {
+                            a: 0.12,
+                            ..theme.accent
+                        })
+                        .child(
+                            div()
+                                .px(px(10.0))
+                                .py(px(4.0))
+                                .rounded(px(6.0))
+                                .text_sm()
+                                .bg(theme.panel_bg)
+                                .text_color(theme.text)
+                                .border_1()
+                                .border_color(theme.border)
+                                .child("Swap here"),
+                        )
+                        .with_animation(
+                            SharedString::from(format!("pane-landing-{}", pane.pane_id)),
+                            landing_fade(),
+                            |overlay, t| overlay.opacity(t),
+                        )
+                        .into_any_element()
+                } else {
+                    overlay
+                        .bg(Hsla {
+                            a: 0.45,
+                            ..theme.terminal_bg
+                        })
+                        .into_any_element()
+                });
+            }
+        }
 
         let mut pane_grips = Vec::new();
         if let (Some(surface), Some(metrics)) = (&surface, &metrics) {
@@ -2809,11 +2949,21 @@ impl GuiApp {
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, _| {
                 this.on_terminal_scroll(event);
             }))
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<DraggedPane>, _, cx| {
+                    let source = event.drag(cx).pane_id.clone();
+                    let target = this
+                        .pane_id_at(event.event.position)
+                        .filter(|target| *target != source);
+                    this.set_drag_target(Some(DragTarget::Pane { source, target }), cx);
+                }),
+            )
             .on_drop(cx.listener(|this, dragged: &DraggedPane, window, cx| {
                 this.drop_pane(dragged, window.mouse_position());
                 cx.notify();
             }))
             .child(surface_canvas)
+            .children(pane_overlays)
             .children(pane_grips)
             .when_some(placeholder, |terminal, message| {
                 terminal.child(
@@ -2988,7 +3138,10 @@ impl Render for GuiApp {
             .on_modifiers_changed(cx.listener(|_, _: &ModifiersChangedEvent, _, cx| cx.notify()))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _: &MouseUpEvent, _, cx| this.finish_sidebar_drag(cx)),
+                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                    this.finish_sidebar_drag(cx);
+                    this.set_drag_target(None, cx);
+                }),
             )
             .when(self.sidebar_dragging, |root| root.cursor_col_resize())
             .child(self.render_sidebar(cx))
@@ -3039,10 +3192,15 @@ mod tests {
 
     #[test]
     fn dropping_a_tab_lands_on_the_target_position() {
-        assert_eq!(tab_insert_index(2, 2), None);
-        // Tab 0 dropped on tab 2 ends up third: insert before index 3.
-        assert_eq!(tab_insert_index(0, 2), Some(3));
-        assert_eq!(tab_insert_index(3, 1), Some(1));
+        // Either edge of the dragged tab itself, or the gap next to it, is a no-op.
+        assert_eq!(tab_insert_index(2, 2, false), None);
+        assert_eq!(tab_insert_index(2, 2, true), None);
+        assert_eq!(tab_insert_index(2, 1, true), None);
+        assert_eq!(tab_insert_index(2, 3, false), None);
+        // Tab 0 dropped on the right half of tab 2 lands after it.
+        assert_eq!(tab_insert_index(0, 2, true), Some(3));
+        assert_eq!(tab_insert_index(0, 2, false), Some(2));
+        assert_eq!(tab_insert_index(3, 1, false), Some(1));
     }
 
     #[test]
