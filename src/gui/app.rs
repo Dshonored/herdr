@@ -72,6 +72,8 @@ pub(crate) struct GuiApp {
     usage: HashMap<ClientEndpointId, UsageState>,
     usage_expanded: HashSet<AgentKind>,
     claude_limits: HashMap<ClientEndpointId, LimitsHook>,
+    /// Scanned host keys of machines waiting for first-connection trust.
+    host_keys: HashMap<ClientEndpointId, Result<super::host_keys::ScannedKey, String>>,
     update_status: UpdateStatus,
     update_next: Instant,
     /// This computer's `[ui] max_fps`, read when settings open.
@@ -154,6 +156,7 @@ impl GuiApp {
             usage: HashMap::new(),
             usage_expanded: HashSet::new(),
             claude_limits: HashMap::new(),
+            host_keys: HashMap::new(),
             update_status: UpdateStatus::Idle,
             update_next: Instant::now() + FIRST_UPDATE_CHECK,
             local_max_fps: None,
@@ -363,9 +366,24 @@ impl GuiApp {
                     let host = &mut self.hosts[index];
                     warn!(machine = %host.label, %error, "machine connection failed");
                     host.allow_remote_restart = false;
-                    host.disconnect(HostStatus::Offline(error));
-                    host.failures += 1;
-                    host.retry_at = Some(Instant::now() + retry_delay(host.failures));
+                    let target = match &host.target {
+                        HostTarget::Ssh { target, .. } => Some(target.clone()),
+                        HostTarget::Local => None,
+                    };
+                    let shown = target.as_deref().unwrap_or(&host.label).to_owned();
+                    let message = super::host_keys::explain(&error, &shown);
+                    match (super::host_keys::classify(&error), target) {
+                        // No retry: only the user can vouch for a machine's identity.
+                        (super::host_keys::SshProblem::UnknownHostKey, Some(target)) => {
+                            host.disconnect(HostStatus::NeedsTrust(message));
+                            self.scan_host_key(index, target, cx);
+                        }
+                        _ => {
+                            host.disconnect(HostStatus::Offline(message));
+                            host.failures += 1;
+                            host.retry_at = Some(Instant::now() + retry_delay(host.failures));
+                        }
+                    }
                 }
                 ConnectionEvent::Disconnected => {
                     let host = &mut self.hosts[index];
@@ -873,6 +891,83 @@ impl GuiApp {
         true
     }
 
+    fn scan_host_key(&mut self, index: usize, target: String, cx: &mut Context<Self>) {
+        let id = self.hosts[index].id.clone();
+        self.host_keys.remove(&id);
+        let task = cx
+            .background_executor()
+            .spawn(async move { super::host_keys::scan(&target) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.host_keys.insert(id, result);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Shows the scanned fingerprint and asks before recording it.
+    fn open_trust_dialog(&mut self, index: usize, window: &mut Window) {
+        let host = &self.hosts[index];
+        match self.host_keys.get(&host.id) {
+            None => self.show_notice(format!("Reading {}'s host key…", host.label)),
+            Some(Err(error)) => {
+                let notice = format!("Couldn't read {}'s host key: {error}", host.label);
+                self.show_notice(notice);
+            }
+            Some(Ok(key)) => {
+                let message = format!(
+                    "This computer has never connected to {} ({}). Its host key fingerprint is:
+
+{}
+
+Trust it only if it matches the machine. On the machine itself, `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` prints its fingerprint.",
+                    host.label,
+                    key.host,
+                    key.fingerprints.join("
+")
+                );
+                self.dialog = Some((
+                    index,
+                    Dialog::confirm(
+                        format!("Trust {}?", host.label),
+                        &message,
+                        "Trust & connect",
+                        false,
+                        Command::TrustHostKey,
+                    ),
+                ));
+                window.focus(&self.form_focus);
+            }
+        }
+    }
+
+    fn trust_host_key(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(Ok(key)) = self.host_keys.get(&self.hosts[index].id).cloned() else {
+            return;
+        };
+        let task = cx
+            .background_executor()
+            .spawn(async move { super::host_keys::trust(&key) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => {
+                        let host = &mut this.hosts[index];
+                        this.host_keys.remove(&host.id);
+                        host.failures = 0;
+                        this.connect(index);
+                    }
+                    Err(error) => this.show_notice(format!("couldn't save the host key: {error}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     pub(crate) fn toggle_usage_details(&mut self, agent: AgentKind) {
         if !self.usage_expanded.remove(&agent) {
             self.usage_expanded.insert(agent);
@@ -1199,6 +1294,7 @@ impl GuiApp {
                         HostStatus::Connecting => "connecting".to_owned(),
                         HostStatus::SettingUp(message)
                         | HostStatus::NeedsRestart(message)
+                        | HostStatus::NeedsTrust(message)
                         | HostStatus::Offline(message) => message.clone(),
                     }),
                 }
@@ -1392,6 +1488,10 @@ impl GuiApp {
                 self.remove_profile(&profile_id);
                 return;
             }
+            Command::TrustHostKey => {
+                self.trust_host_key(host, cx);
+                return;
+            }
             _ => {}
         }
         // Remaining actions change what the machine shows, so bring it forward.
@@ -1555,9 +1655,10 @@ fn dot(color: Hsla) -> impl IntoElement {
 fn host_status_color(theme: &Theme, host: &HostState) -> Hsla {
     match &host.status {
         HostStatus::Online => theme.status_color(AgentStatus::Idle),
-        HostStatus::Connecting | HostStatus::SettingUp(_) | HostStatus::NeedsRestart(_) => {
-            theme.status_color(AgentStatus::Working)
-        }
+        HostStatus::Connecting
+        | HostStatus::SettingUp(_)
+        | HostStatus::NeedsRestart(_)
+        | HostStatus::NeedsTrust(_) => theme.status_color(AgentStatus::Working),
         HostStatus::Offline(_) => theme.danger,
     }
 }
@@ -1604,6 +1705,7 @@ impl GuiApp {
                 (HostStatus::Connecting, _) => "connecting…".into(),
                 (HostStatus::SettingUp(message), _) => message.clone().into(),
                 (HostStatus::NeedsRestart(message), _) => message.clone().into(),
+                (HostStatus::NeedsTrust(message), _) => message.clone().into(),
                 (HostStatus::Online, HostTarget::Ssh { target, .. }) => target.clone().into(),
                 (HostStatus::Online, HostTarget::Local) => "this computer".into(),
             };
@@ -1670,6 +1772,25 @@ impl GuiApp {
                             cx.notify();
                         }))
                         .child("Update & restart"),
+                );
+            }
+            if matches!(host.status, HostStatus::NeedsTrust(_)) {
+                row = row.child(
+                    div()
+                        .id(("trust", index))
+                        .px(px(6.0))
+                        .py(px(2.0))
+                        .rounded(px(4.0))
+                        .text_xs()
+                        .bg(theme.accent)
+                        .text_color(theme.panel_bg)
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            this.open_trust_dialog(index, window);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }))
+                        .child("Trust…"),
                 );
             }
             if matches!(host.status, HostStatus::Offline(_)) {
@@ -2060,6 +2181,13 @@ impl GuiApp {
             (HostStatus::NeedsRestart(message), None) => Some(
                 format!(
                     "{message}. Click 'Update & restart' next to {} to continue.",
+                    host.label
+                )
+                .into(),
+            ),
+            (HostStatus::NeedsTrust(_), None) => Some(
+                format!(
+                    "This is the first connection to {}. Click 'Trust…' next to it to check its host key.",
                     host.label
                 )
                 .into(),

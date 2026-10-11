@@ -28,6 +28,8 @@ pub(crate) enum Command {
     RemoveMachine,
     /// Remove a saved machine by catalog profile id (it may be disabled).
     RemoveProfile(String),
+    /// Record the scanned host key of the menu's machine and connect.
+    TrustHostKey,
     Paste,
 }
 

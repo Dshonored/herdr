@@ -28,6 +28,8 @@ pub(crate) enum HostStatus {
     SettingUp(String),
     /// Updating needs to stop the machine's running herdr server; waiting for consent.
     NeedsRestart(String),
+    /// First SSH connection: waiting for the user to confirm the machine's host key.
+    NeedsTrust(String),
     Online,
     Offline(String),
 }

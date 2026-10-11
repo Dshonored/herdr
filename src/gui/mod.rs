@@ -12,6 +12,7 @@ mod connection;
 mod dialog;
 mod host;
 mod host_form;
+mod host_keys;
 mod menu;
 mod prefs;
 mod settings;
