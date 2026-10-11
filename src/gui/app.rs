@@ -883,6 +883,16 @@ impl GuiApp {
                     self.copy_selection(cx);
                     true
                 }
+                "a" => {
+                    self.select_all();
+                    true
+                }
+                "k" => {
+                    if let (_, _, Some(pane_id)) = self.focused_ids() {
+                        self.request("pane.clear", serde_json::json!({ "pane_id": pane_id }));
+                    }
+                    true
+                }
                 "t" => {
                     self.new_tab();
                     true
@@ -915,7 +925,9 @@ impl GuiApp {
                 return;
             }
         }
-        let Some(input) = terminal::key_input(keystroke, event.is_held) else {
+        let Some(input) = terminal::editing_shortcut(keystroke)
+            .or_else(|| terminal::key_input(keystroke, event.is_held))
+        else {
             return;
         };
         if self.selection.take().is_some() {
@@ -933,9 +945,15 @@ impl GuiApp {
     }
 
     /// Starts selecting text on a left press: always with Shift, otherwise only in panes
-    /// whose program doesn't use the mouse. False when the press belongs to the program.
-    fn start_selection(&mut self, position: Point<Pixels>, modifiers: &gpui::Modifiers) -> bool {
-        self.selection = None;
+    /// whose program doesn't use the mouse. Double-click picks a word, triple-click a line,
+    /// and Shift+click extends the current selection.
+    fn start_selection(
+        &mut self,
+        position: Point<Pixels>,
+        modifiers: &gpui::Modifiers,
+        click_count: usize,
+    ) -> bool {
+        let previous = self.selection.take();
         let Some((col, row)) = self.mouse_cell(position) else {
             return false;
         };
@@ -952,9 +970,25 @@ impl GuiApp {
             let pane_id = pane.pane_id.clone();
             self.request("pane.focus", serde_json::json!({ "pane_id": pane_id }));
         }
-        self.selection = Some(terminal::Selection::start(pane, col, row));
+        self.selection = Some(match (click_count, previous) {
+            (1, Some(mut extended)) if modifiers.shift && extended.pane_id == pane.pane_id => {
+                extended.extend(col, row);
+                extended
+            }
+            (2, _) => terminal::Selection::word(pane, &surface.frame, col, row),
+            (3.., _) => terminal::Selection::line(pane, col, row),
+            _ => terminal::Selection::start(pane, col, row),
+        });
         self.selecting = true;
         true
+    }
+
+    /// Selects everything visible in the focused pane.
+    fn select_all(&mut self) {
+        let surface = self.selected_host().surface.as_ref();
+        self.selection = surface
+            .and_then(|surface| surface.panes.iter().find(|pane| pane.focused))
+            .map(terminal::Selection::all);
     }
 
     fn link_at(&self, position: Point<Pixels>) -> Option<String> {
@@ -2854,7 +2888,9 @@ impl GuiApp {
                         }
                     }
                     let had_selection = this.selection.is_some();
-                    if this.start_selection(event.position, &event.modifiers) || had_selection {
+                    if this.start_selection(event.position, &event.modifiers, event.click_count)
+                        || had_selection
+                    {
                         cx.notify();
                     }
                     if this.selecting {

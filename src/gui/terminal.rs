@@ -196,6 +196,58 @@ impl Selection {
         }
     }
 
+    /// The word under a cell (double-click): a run of non-blank, non-bracket characters.
+    pub(crate) fn word(pane: &PaneSurfacePane, frame: &FrameData, col: u16, row: u16) -> Self {
+        let mut selection = Self::start(pane, col, row);
+        let (col, row) = selection.anchor;
+        let in_word =
+            |col: u16| {
+                let index = usize::from(row) * usize::from(frame.width) + usize::from(col);
+                frame.cells.get(index).is_some_and(|cell| {
+                    cell.skip
+                        || cell.symbol.chars().next().is_some_and(|ch| {
+                            !ch.is_whitespace() && !"()[]{}<>'\"`,;|".contains(ch)
+                        })
+                })
+            };
+        if !in_word(col) {
+            return selection;
+        }
+        let left = selection.area.x;
+        let right = left + selection.area.width.saturating_sub(1);
+        let mut first = col;
+        while first > left && in_word(first - 1) {
+            first -= 1;
+        }
+        let mut last = col;
+        while last < right && in_word(last + 1) {
+            last += 1;
+        }
+        selection.anchor = (first, row);
+        selection.head = (last, row);
+        selection
+    }
+
+    /// The pane's whole row under a cell (triple-click).
+    pub(crate) fn line(pane: &PaneSurfacePane, col: u16, row: u16) -> Self {
+        let mut selection = Self::start(pane, col, row);
+        let row = selection.anchor.1;
+        selection.anchor = (selection.area.x, row);
+        selection.head = (
+            selection.area.x + selection.area.width.saturating_sub(1),
+            row,
+        );
+        selection
+    }
+
+    /// Everything visible in the pane (Cmd+A).
+    pub(crate) fn all(pane: &PaneSurfacePane) -> Self {
+        let area = pane.inner_rect;
+        let mut selection = Self::start(pane, area.x, area.y);
+        selection.head = clamp_to(area, u16::MAX, u16::MAX);
+        selection
+    }
+
     pub(crate) fn extend(&mut self, col: u16, row: u16) {
         self.head = clamp_to(self.area, col, row);
     }
@@ -807,6 +859,63 @@ pub(crate) fn key_input(keystroke: &Keystroke, repeat: bool) -> Option<ClientPan
     })
 }
 
+fn editing_key(code: ClientKeyCode, modifiers: u8) -> ClientPaneInputEvent {
+    ClientPaneInputEvent::Key {
+        code,
+        modifiers,
+        kind: ClientKeyKind::Press,
+        repeat_count: 1,
+        shifted_codepoint: None,
+        generated_text: None,
+        tracks_release: false,
+        physical_key_id: None,
+        windows_record: None,
+    }
+}
+
+/// macOS text-editing shortcuts translated into keys shells, readline, and agent CLIs
+/// understand, as iTerm2 and Ghostty do. Programs never see Cmd, and treat Option+arrow
+/// inconsistently, so these are rewritten before they reach the pane.
+///
+/// | Shortcut         | Sends    | Action                        |
+/// | ---------------- | -------- | ----------------------------- |
+/// | Cmd+Backspace    | Ctrl+U   | delete to start of line       |
+/// | Cmd+Delete       | Ctrl+K   | delete to end of line         |
+/// | Option+Backspace | Ctrl+W   | delete previous word          |
+/// | Option+Delete    | Option+D | delete next word              |
+/// | Cmd+Left         | Ctrl+A   | start of line                 |
+/// | Cmd+Right        | Ctrl+E   | end of line                   |
+/// | Option+Left      | Option+B | previous word                 |
+/// | Option+Right     | Option+F | next word                     |
+/// | Cmd+Z            | Ctrl+_   | undo (readline, zsh)          |
+/// | Cmd+Shift+Z      | Option+_ | redo where bound (zsh)        |
+pub(crate) fn editing_shortcut(keystroke: &Keystroke) -> Option<ClientPaneInputEvent> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let modifiers = &keystroke.modifiers;
+    if modifiers.control {
+        return None;
+    }
+    let command = modifiers.platform && !modifiers.alt;
+    let option = modifiers.alt && !modifiers.platform;
+    let ctrl = |ch| Some(editing_key(ClientKeyCode::Char(ch), KEY_CONTROL));
+    let alt = |ch| Some(editing_key(ClientKeyCode::Char(ch), KEY_ALT));
+    match (keystroke.key.as_str(), command, option, modifiers.shift) {
+        ("backspace", true, _, false) => ctrl('u'),
+        ("delete", true, _, false) => ctrl('k'),
+        ("backspace", _, true, false) => ctrl('w'),
+        ("delete", _, true, false) => alt('d'),
+        ("left", true, _, false) => ctrl('a'),
+        ("right", true, _, false) => ctrl('e'),
+        ("left", _, true, false) => alt('b'),
+        ("right", _, true, false) => alt('f'),
+        ("z", true, _, false) => ctrl('_'),
+        ("z", true, _, true) => alt('_'),
+        _ => None,
+    }
+}
+
 pub(crate) fn mouse_button(button: gpui::MouseButton) -> Option<ClientMouseButton> {
     match button {
         gpui::MouseButton::Left => Some(ClientMouseButton::Left),
@@ -875,6 +984,70 @@ mod tests {
         };
         selection.extend(head.0, head.1);
         selection
+    }
+
+    #[test]
+    fn mac_editing_shortcuts_become_terminal_keys() {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let command = gpui::Modifiers::command();
+        let option = gpui::Modifiers::alt();
+        let sent = |key: &str, modifiers| match editing_shortcut(&keystroke(key, None, modifiers)) {
+            Some(ClientPaneInputEvent::Key {
+                code: ClientKeyCode::Char(ch),
+                modifiers,
+                ..
+            }) => Some((ch, modifiers)),
+            _ => None,
+        };
+        assert_eq!(sent("backspace", command), Some(('u', KEY_CONTROL)));
+        assert_eq!(sent("backspace", option), Some(('w', KEY_CONTROL)));
+        assert_eq!(sent("left", command), Some(('a', KEY_CONTROL)));
+        assert_eq!(sent("right", option), Some(('f', KEY_ALT)));
+        assert_eq!(sent("z", command), Some(('_', KEY_CONTROL)));
+        // Plain keys and other chords pass through unchanged.
+        assert_eq!(sent("backspace", gpui::Modifiers::none()), None);
+        assert_eq!(sent("a", command), None);
+    }
+
+    #[test]
+    fn double_and_triple_click_pick_a_word_or_line() {
+        let frame = text_frame(&["|cd ~/src/herdr && ls |"]);
+        let pane = PaneSurfacePane {
+            pane_id: "p".into(),
+            content_revision: 0,
+            rect: SurfaceRect {
+                x: 0,
+                y: 0,
+                width: 23,
+                height: 1,
+            },
+            inner_rect: SurfaceRect {
+                x: 1,
+                y: 0,
+                width: 21,
+                height: 1,
+            },
+            scrollbar_rect: None,
+            scroll: None,
+            focused: true,
+            mouse_reporting: false,
+            sgr_pixel_mouse: false,
+            alternate_screen_active: false,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        assert_eq!(
+            Selection::word(&pane, &frame, 8, 0).text(&frame),
+            "~/src/herdr"
+        );
+        assert!(Selection::word(&pane, &frame, 3, 0).is_empty());
+        assert_eq!(
+            Selection::line(&pane, 5, 0).text(&frame),
+            "cd ~/src/herdr && ls"
+        );
+        assert_eq!(Selection::all(&pane).text(&frame), "cd ~/src/herdr && ls");
     }
 
     #[test]
