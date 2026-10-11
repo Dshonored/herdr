@@ -157,7 +157,24 @@ jobs:
 
           # Unsigned builds still need an ad-hoc signature over the whole bundle.
           codesign --force --deep --sign - "$app"
+          # The zip is what installed copies update from.
           ditto -c -k --keepParent "$app" "$ASSET"
+
+          # The installer puts herdr.app in /Applications. Opening an app straight from
+          # Downloads makes macOS run a read-only translocated copy that can't update itself
+          # and vanishes under the local server it started.
+          pkgroot=pkgroot
+          mkdir -p "$pkgroot"
+          ditto "$app" "$pkgroot/herdr.app"
+          pkgbuild --analyze --root "$pkgroot" component.plist
+          # Not relocatable: always install to /Applications, never over a copy elsewhere.
+          plutil -replace 0.BundleIsRelocatable -bool NO component.plist
+          pkgbuild --root "$pkgroot" --component-plist component.plist \
+            --install-location /Applications \
+            --scripts packaging/desktop/macos/scripts \
+            --identifier io.github.dshonored.herdr-desktop \
+            --version "$HERDR_DESKTOP_VERSION" \
+            "${ASSET%.zip}.pkg"
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -174,7 +191,9 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ${{ matrix.asset }}
-          path: ${{ matrix.asset }}
+          path: |
+            ${{ matrix.asset }}
+            herdr-desktop-*.pkg
           retention-days: 7
 
   release:
@@ -208,11 +227,12 @@ jobs:
           | Platform | Download |
           | --- | --- |
           | Windows x86_64 | \`herdr-desktop-windows-x86_64.zip\` (unzip, run \`herdr.exe gui\`) |
-          | macOS Apple Silicon | \`herdr-desktop-macos-aarch64.zip\` (unzip, move herdr.app to Applications) |
-          | macOS Intel | \`herdr-desktop-macos-x86_64.zip\` (unzip, move herdr.app to Applications) |
+          | macOS Apple Silicon | \`herdr-desktop-macos-aarch64.pkg\` (open and install; herdr appears in Applications) |
+          | macOS Intel | \`herdr-desktop-macos-x86_64.pkg\` (open and install; herdr appears in Applications) |
           | Linux x86_64 | \`herdr-desktop-linux-x86_64.tar.gz\` (extract, run \`./herdr-desktop/install.sh\`, then open herdr from your app menu) |
 
-          Builds are unsigned: on macOS right-click herdr.app → Open the first time; on Windows choose "Run anyway".
+          The macOS \`.zip\` files are what installed copies update from; use the \`.pkg\` to install.
+          Builds are unsigned: on macOS right-click the .pkg → Open the first time (or System Settings → Privacy & Security → Open Anyway); on Windows choose "Run anyway".
           Installed copies update themselves from this page (Settings → Updates).
           EOF
           gh release create "$GITHUB_REF_NAME" herdr-desktop-* SHA256SUMS \

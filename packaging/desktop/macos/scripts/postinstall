@@ -1,0 +1,10 @@
+#!/bin/sh
+# The installer writes herdr.app as root; hand it to the logged-in user so the app can
+# update itself in place without asking for an admin password.
+set -e
+app="${3%/}/Applications/herdr.app"
+user=$(stat -f%Su /dev/console)
+if [ -d "$app" ] && [ -n "$user" ] && [ "$user" != root ]; then
+  chown -R "$user":staff "$app"
+fi
+exit 0

@@ -155,7 +155,22 @@ fn install_root_for(exe: &Path) -> Option<PathBuf> {
 fn install_dir() -> Result<PathBuf, String> {
     let exe =
         std::env::current_exe().map_err(|error| format!("can't find this program: {error}"))?;
+    if is_translocated(&exe) {
+        return Err(
+            "macOS is running herdr from a temporary read-only copy because it was \
+             opened outside Applications. Install it with the herdr .pkg (or move herdr.app \
+             to Applications), then reopen it."
+                .into(),
+        );
+    }
     install_root_for(&exe).ok_or_else(|| "can't find the install folder".into())
+}
+
+/// Gatekeeper runs quarantined apps opened from Downloads and similar folders from a
+/// randomized read-only mount that disappears later; nothing there can be updated.
+fn is_translocated(exe: &Path) -> bool {
+    exe.components()
+        .any(|part| part.as_os_str() == "AppTranslocation")
 }
 
 /// The folder whose contents map onto the install root. Archives that wrap the app in one
@@ -353,7 +368,10 @@ pub(crate) fn cleanup_previous_update() {
                     .file_name()
                     .and_then(|name| name.to_str())
                     .is_some_and(|name| {
-                        matches!(name, "conpty" | "Contents" | "MacOS" | "Resources")
+                        matches!(
+                            name,
+                            "conpty" | "Contents" | "MacOS" | "Resources" | "_CodeSignature"
+                        )
                     });
                 if known {
                     stack.push(path);
@@ -429,6 +447,16 @@ mod tests {
             install_root_for(plain).unwrap(),
             PathBuf::from("/opt/herdr")
         );
+    }
+
+    #[test]
+    fn translocated_copies_are_not_updatable() {
+        assert!(is_translocated(Path::new(
+            "/private/var/folders/ls/x/T/AppTranslocation/3877A32F/d/herdr.app/Contents/MacOS/herdr"
+        )));
+        assert!(!is_translocated(Path::new(
+            "/Applications/herdr.app/Contents/MacOS/herdr"
+        )));
     }
 
     #[test]
