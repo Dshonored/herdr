@@ -13,6 +13,7 @@ use unicode_width::UnicodeWidthStr as _;
 use crate::protocol::{
     CellData, ClientKeyCode, ClientKeyKind, ClientMouseButton, ClientMouseKind,
     ClientMousePosition, ClientPaneInputEvent, CursorState, FrameData, PaneSurfacePane,
+    SurfaceRect,
 };
 
 use super::theme::Theme;
@@ -173,11 +174,141 @@ struct Segment {
     fixed_width: bool,
 }
 
+/// Text selected by dragging inside one pane, in surface cells. Selection runs like
+/// text: from the anchor to the end of its line, whole lines between, then up to the head.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Selection {
+    pub(crate) pane_id: String,
+    area: SurfaceRect,
+    anchor: (u16, u16),
+    head: (u16, u16),
+}
+
+impl Selection {
+    pub(crate) fn start(pane: &PaneSurfacePane, col: u16, row: u16) -> Self {
+        let area = pane.inner_rect;
+        let point = clamp_to(area, col, row);
+        Self {
+            pane_id: pane.pane_id.clone(),
+            area,
+            anchor: point,
+            head: point,
+        }
+    }
+
+    pub(crate) fn extend(&mut self, col: u16, row: u16) {
+        self.head = clamp_to(self.area, col, row);
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.anchor == self.head
+    }
+
+    /// `(row, first column, end column exclusive)` for each selected row.
+    pub(crate) fn row_spans(&self) -> Vec<(u16, u16, u16)> {
+        let (start, end) = {
+            let (a, h) = (self.anchor, self.head);
+            if (a.1, a.0) <= (h.1, h.0) {
+                (a, h)
+            } else {
+                (h, a)
+            }
+        };
+        let left = self.area.x;
+        let right = self.area.x.saturating_add(self.area.width);
+        (start.1..=end.1)
+            .map(|row| {
+                let first = if row == start.1 { start.0 } else { left };
+                let last = if row == end.1 { end.0 + 1 } else { right };
+                (row, first, last.max(first))
+            })
+            .collect()
+    }
+
+    /// The selected text, one line per row with trailing blanks trimmed.
+    pub(crate) fn text(&self, frame: &FrameData) -> String {
+        let width = usize::from(frame.width);
+        self.row_spans()
+            .into_iter()
+            .map(|(row, first, last)| {
+                let start = usize::from(row) * width;
+                let mut line = String::new();
+                for col in first..last.min(frame.width) {
+                    let Some(cell) = frame.cells.get(start + usize::from(col)) else {
+                        break;
+                    };
+                    // Wide characters occupy a second, skipped cell.
+                    if cell.skip {
+                        continue;
+                    }
+                    line.push_str(if cell.symbol.is_empty() {
+                        " "
+                    } else {
+                        &cell.symbol
+                    });
+                }
+                line.trim_end().to_owned()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+/// The link under a surface cell: its OSC 8 target, or a plain `http(s)://` URL in the
+/// row's text.
+pub(crate) fn link_at(frame: &FrameData, col: u16, row: u16) -> Option<String> {
+    static URL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"https?://[^\s<>"'`]+"#).expect("valid URL pattern")
+    });
+    if col >= frame.width || row >= frame.height {
+        return None;
+    }
+    let width = usize::from(frame.width);
+    let cells = frame.cells.get(usize::from(row) * width..)?.get(..width)?;
+    if let Some(link) = cells[usize::from(col)]
+        .hyperlink
+        .and_then(|index| frame.hyperlinks.get(index as usize))
+    {
+        return Some(link.clone());
+    }
+    // Rebuild the row's text, remembering which column each byte came from.
+    let mut text = String::new();
+    let mut byte_cols = Vec::new();
+    for (index, cell) in cells.iter().enumerate() {
+        if cell.skip {
+            continue;
+        }
+        let symbol = if cell.symbol.is_empty() {
+            " "
+        } else {
+            &cell.symbol
+        };
+        byte_cols.extend(std::iter::repeat_n(index, symbol.len()));
+        text.push_str(symbol);
+    }
+    let col = usize::from(col);
+    URL.find_iter(&text).find_map(|found| {
+        let url = found
+            .as_str()
+            .trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '}']);
+        let first = byte_cols[found.start()];
+        let last = byte_cols[found.start() + url.len() - 1];
+        (first..=last).contains(&col).then(|| url.to_owned())
+    })
+}
+
+fn clamp_to(area: SurfaceRect, col: u16, row: u16) -> (u16, u16) {
+    let last_col = area.x.saturating_add(area.width.saturating_sub(1));
+    let last_row = area.y.saturating_add(area.height.saturating_sub(1));
+    (col.clamp(area.x, last_col), row.clamp(area.y, last_row))
+}
+
 /// Paints one server-rendered frame at `bounds.origin`.
 pub(crate) fn paint_frame(
     bounds: Bounds<Pixels>,
     frame: &FrameData,
     panes: &[PaneSurfacePane],
+    selection: Option<&Selection>,
     metrics: &CellMetrics,
     theme: &Theme,
     window_focused: bool,
@@ -213,6 +344,16 @@ pub(crate) fn paint_frame(
                 window.paint_quad(fill(grid.cells(x as u16, end as u16, y), bg));
             }
             x = end;
+        }
+
+        if let Some(selection) = selection {
+            let highlight = Hsla {
+                a: 0.3,
+                ..theme.terminal_fg
+            };
+            for (_, first, last) in selection.row_spans().into_iter().filter(|span| span.0 == y) {
+                window.paint_quad(fill(grid.cells(first, last, y), highlight));
+            }
         }
 
         let (segments, shapes) = row_segments(row, metrics, theme);
@@ -699,6 +840,79 @@ pub(crate) fn mouse_input(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn text_frame(lines: &[&str]) -> FrameData {
+        let width = lines.iter().map(|line| line.len()).max().unwrap_or(0) as u16;
+        let cells = lines
+            .iter()
+            .flat_map(|line| {
+                (0..usize::from(width)).map(move |col| CellData {
+                    symbol: line.get(col..=col).unwrap_or("").to_owned(),
+                    fg: 0,
+                    bg: 0,
+                    modifier: 0,
+                    skip: false,
+                    hyperlink: None,
+                })
+            })
+            .collect();
+        FrameData {
+            cells,
+            width,
+            height: lines.len() as u16,
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        }
+    }
+
+    fn selection(area: SurfaceRect, anchor: (u16, u16), head: (u16, u16)) -> Selection {
+        let mut selection = Selection {
+            pane_id: "p".into(),
+            area,
+            anchor: clamp_to(area, anchor.0, anchor.1),
+            head: (0, 0),
+        };
+        selection.extend(head.0, head.1);
+        selection
+    }
+
+    #[test]
+    fn links_come_from_osc8_or_plain_urls() {
+        let mut frame = text_frame(&["see https://herdr.dev/docs. ok"]);
+        assert_eq!(
+            link_at(&frame, 10, 0).as_deref(),
+            Some("https://herdr.dev/docs")
+        );
+        // The trailing period and the text after the URL are not part of it.
+        assert_eq!(link_at(&frame, 26, 0), None);
+        assert_eq!(link_at(&frame, 1, 0), None);
+        frame.cells[1].hyperlink = Some(0);
+        frame.hyperlinks.push("https://example.test".into());
+        assert_eq!(
+            link_at(&frame, 1, 0).as_deref(),
+            Some("https://example.test")
+        );
+        assert_eq!(link_at(&frame, 99, 0), None);
+    }
+
+    #[test]
+    fn selection_reads_like_text_and_stays_in_its_pane() {
+        let frame = text_frame(&["|hello world |", "|second line |", "|third       |"]);
+        let pane = SurfaceRect {
+            x: 1,
+            y: 0,
+            width: 12,
+            height: 3,
+        };
+        // Dragged backwards from "line" up to "world", past the pane's right border.
+        let picked = selection(pane, (11, 1), (7, 0));
+        assert_eq!(picked.text(&frame), "world\nsecond line");
+        // Dragging outside the pane clamps to its edges instead of copying borders.
+        let all = selection(pane, (0, 0), (40, 9));
+        assert_eq!(all.text(&frame), "hello world\nsecond line\nthird");
+        assert!(selection(pane, (3, 1), (3, 1)).is_empty());
+    }
 
     fn keystroke(key: &str, key_char: Option<&str>, modifiers: gpui::Modifiers) -> Keystroke {
         Keystroke {

@@ -193,6 +193,9 @@ pub(crate) struct GuiApp {
     /// Open dialog and the machine its action applies to.
     dialog: Option<(usize, Dialog)>,
     mouse_pane: Option<String>,
+    /// Text selected by dragging, and whether a selection drag is in progress.
+    selection: Option<terminal::Selection>,
+    selecting: bool,
     scroll_remainder: f32,
     /// `[ui] mouse_scroll_lines`: lines per mouse wheel notch, as in the terminal app.
     scroll_lines: f32,
@@ -279,6 +282,8 @@ impl GuiApp {
             )),
             dialog: None,
             mouse_pane: None,
+            selection: None,
+            selecting: false,
             scroll_remainder: 0.0,
             scroll_lines: crate::config::Config::load().config.ui.mouse_scroll_lines() as f32,
             resize: ResizeThrottle::default(),
@@ -557,6 +562,7 @@ impl GuiApp {
         }
         let previous = self.selected;
         self.selected = index;
+        self.selection = None;
         self.usage_next = Instant::now();
         self.stats_next = Instant::now();
         if self.hosts[previous].supports_surface_interest() {
@@ -832,6 +838,10 @@ impl GuiApp {
                     self.paste(cx);
                     true
                 }
+                "c" if self.selection.is_some() => {
+                    self.copy_selection(cx);
+                    true
+                }
                 "t" => {
                     self.new_tab();
                     true
@@ -867,6 +877,9 @@ impl GuiApp {
         let Some(input) = terminal::key_input(keystroke, event.is_held) else {
             return;
         };
+        if self.selection.take().is_some() {
+            cx.notify();
+        }
         if let (_, _, Some(pane_id)) = self.focused_ids() {
             self.send_pane_input(pane_id, vec![input]);
         }
@@ -876,6 +889,71 @@ impl GuiApp {
     fn mouse_cell(&self, position: Point<Pixels>) -> Option<(u16, u16)> {
         let metrics = self.metrics.as_ref()?;
         Some(metrics.cell_at(self.terminal_origin.get(), position))
+    }
+
+    /// Starts selecting text on a left press: always with Shift, otherwise only in panes
+    /// whose program doesn't use the mouse. False when the press belongs to the program.
+    fn start_selection(&mut self, position: Point<Pixels>, modifiers: &gpui::Modifiers) -> bool {
+        self.selection = None;
+        let Some((col, row)) = self.mouse_cell(position) else {
+            return false;
+        };
+        let Some(surface) = self.selected_host().surface.clone() else {
+            return false;
+        };
+        let Some(pane) = terminal::pane_at(&surface.panes, col, row) else {
+            return false;
+        };
+        if pane.mouse_reporting && !modifiers.shift {
+            return false;
+        }
+        if !pane.focused {
+            let pane_id = pane.pane_id.clone();
+            self.request("pane.focus", serde_json::json!({ "pane_id": pane_id }));
+        }
+        self.selection = Some(terminal::Selection::start(pane, col, row));
+        self.selecting = true;
+        true
+    }
+
+    fn link_at(&self, position: Point<Pixels>) -> Option<String> {
+        let (col, row) = self.mouse_cell(position)?;
+        let surface = self.selected_host().surface.as_ref()?;
+        terminal::link_at(&surface.frame, col, row)
+    }
+
+    fn extend_selection(&mut self, position: Point<Pixels>) {
+        let cell = self.mouse_cell(position);
+        if let (Some(selection), Some((col, row))) = (self.selection.as_mut(), cell) {
+            selection.extend(col, row);
+        }
+    }
+
+    /// Ends a selection drag; a non-empty selection is copied, like most terminals.
+    fn finish_selection(&mut self, cx: &mut Context<Self>) {
+        self.selecting = false;
+        if self
+            .selection
+            .as_ref()
+            .is_some_and(|selection| selection.is_empty())
+        {
+            self.selection = None;
+        } else {
+            self.copy_selection(cx);
+        }
+        cx.notify();
+    }
+
+    fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        let host = self.selected_host();
+        let (Some(selection), Some(surface)) = (&self.selection, &host.surface) else {
+            return;
+        };
+        let text = selection.text(&surface.frame);
+        if !text.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            self.show_notice("Copied selection".into());
+        }
     }
 
     fn on_terminal_mouse(
@@ -2532,6 +2610,7 @@ impl GuiApp {
         let theme = self.theme.clone();
         let origin = self.terminal_origin.clone();
         let grid = self.grid;
+        let selection = self.selection.clone();
         let entity = cx.entity().downgrade();
         let window_active = window.is_window_active();
 
@@ -2584,10 +2663,18 @@ impl GuiApp {
             move |bounds, (), window, cx| {
                 window.paint_quad(gpui::fill(bounds, theme.terminal_bg));
                 if let (Some(surface), Some(metrics)) = (surface, metrics) {
+                    // A selection whose pane is no longer shown isn't drawn.
+                    let selection = selection.as_ref().filter(|selection| {
+                        surface
+                            .panes
+                            .iter()
+                            .any(|pane| pane.pane_id == selection.pane_id)
+                    });
                     terminal::paint_frame(
                         bounds,
                         &surface.frame,
                         &surface.panes,
+                        selection,
                         &metrics,
                         &theme,
                         window_active,
@@ -2614,6 +2701,25 @@ impl GuiApp {
                         return;
                     }
                     window.focus(&this.terminal_focus);
+                    // Cmd+click (Ctrl+click elsewhere) opens a link, as in other terminals.
+                    let link_modifier = if cfg!(target_os = "macos") {
+                        event.modifiers.platform
+                    } else {
+                        event.modifiers.control
+                    };
+                    if link_modifier {
+                        if let Some(url) = this.link_at(event.position) {
+                            cx.open_url(&url);
+                            return;
+                        }
+                    }
+                    let had_selection = this.selection.is_some();
+                    if this.start_selection(event.position, &event.modifiers) || had_selection {
+                        cx.notify();
+                    }
+                    if this.selecting {
+                        return;
+                    }
                     this.on_terminal_mouse(
                         ClientMouseKind::Down(crate::protocol::ClientMouseButton::Left),
                         event.position,
@@ -2648,7 +2754,11 @@ impl GuiApp {
             )
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, event: &MouseUpEvent, _, _| {
+                cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                    if this.selecting {
+                        this.finish_selection(cx);
+                        return;
+                    }
                     this.on_terminal_mouse(
                         ClientMouseKind::Up(crate::protocol::ClientMouseButton::Left),
                         event.position,
@@ -2678,6 +2788,11 @@ impl GuiApp {
             )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                 if cx.has_active_drag() {
+                    return;
+                }
+                if this.selecting {
+                    this.extend_selection(event.position);
+                    cx.notify();
                     return;
                 }
                 let Some(button) = event.pressed_button.and_then(terminal::mouse_button) else {
