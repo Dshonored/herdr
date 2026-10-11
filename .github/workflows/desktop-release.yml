@@ -181,11 +181,37 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          $stage = Join-Path $env:RUNNER_TEMP "herdr-desktop-windows-x86_64"
+          # Stages and verifies herdr.exe with its ConPTY runtime; that script's own zip
+          # has a fixed layout, so the desktop zip is rebuilt below with the launcher added.
           .\scripts\package_windows_conpty.ps1 `
             -HerdrExe target\${{ matrix.target }}\release\herdr.exe `
             -PackagePath (Join-Path $env:RUNNER_TEMP "Microsoft.Windows.Console.ConPTY.nupkg") `
-            -StageDir (Join-Path $env:RUNNER_TEMP "herdr-desktop-windows-x86_64") `
-            -OutputPath ${{ matrix.asset }}
+            -StageDir $stage `
+            -OutputPath (Join-Path $env:RUNNER_TEMP "herdr-cli.zip")
+
+          # herdr.exe is a console program; shortcuts open this windowless launcher instead.
+          cargo build --release --locked -p herdr-desktop-launcher --target ${{ matrix.target }}
+          if ($LASTEXITCODE -ne 0) { throw "launcher build failed" }
+          Copy-Item target\${{ matrix.target }}\release\herdr-desktop.exe $stage
+
+          python -m pip install --quiet pillow
+          python -c "from PIL import Image; Image.open('assets/logo.png').save(r'$stage\herdr.ico', sizes=[(16,16),(24,24),(32,32),(48,48),(64,64),(128,128),(256,256)])"
+          if ($LASTEXITCODE -ne 0) { throw "icon conversion failed" }
+
+          # The zip is what installed copies update from.
+          & "$env:SystemRoot\System32\tar.exe" -a -c -f ${{ matrix.asset }} -C $stage .
+          if ($LASTEXITCODE -ne 0) { throw "zip failed" }
+
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "Inno Setup install failed" }
+          }
+          $env:HERDR_STAGE_DIR = $stage
+          & $iscc packaging\desktop\windows\herdr.iss
+          if ($LASTEXITCODE -ne 0) { throw "installer build failed" }
+          Move-Item packaging\desktop\windows\herdr-desktop-windows-x86_64-setup.exe .
 
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -194,6 +220,7 @@ jobs:
           path: |
             ${{ matrix.asset }}
             herdr-desktop-*.pkg
+            herdr-desktop-*-setup.exe
           retention-days: 7
 
   release:
@@ -226,12 +253,12 @@ jobs:
 
           | Platform | Download |
           | --- | --- |
-          | Windows x86_64 | \`herdr-desktop-windows-x86_64.zip\` (unzip, run \`herdr.exe gui\`) |
+          | Windows x86_64 | \`herdr-desktop-windows-x86_64-setup.exe\` (run it; herdr appears in the Start menu) |
           | macOS Apple Silicon | \`herdr-desktop-macos-aarch64.pkg\` (open and install; herdr appears in Applications) |
           | macOS Intel | \`herdr-desktop-macos-x86_64.pkg\` (open and install; herdr appears in Applications) |
           | Linux x86_64 | \`herdr-desktop-linux-x86_64.tar.gz\` (extract, run \`./herdr-desktop/install.sh\`, then open herdr from your app menu) |
 
-          The macOS \`.zip\` files are what installed copies update from; use the \`.pkg\` to install.
+          The macOS and Windows \`.zip\` files are what installed copies update from; install with the \`.pkg\` or \`setup.exe\`.
           Builds are unsigned: on macOS right-click the .pkg → Open the first time (or System Settings → Privacy & Security → Open Anyway); on Windows choose "Run anyway".
           Installed copies update themselves from this page (Settings → Updates).
           EOF

@@ -1,0 +1,10 @@
+[package]
+name = "herdr-desktop-launcher"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Windows launcher that opens the herdr desktop app without a console window"
+
+[[bin]]
+name = "herdr-desktop"
+path = "src/main.rs"
