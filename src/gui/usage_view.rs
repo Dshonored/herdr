@@ -27,7 +27,7 @@ fn limit_color(theme: &Theme, used: f64) -> Hsla {
     }
 }
 
-fn bar(theme: &Theme, used_percent: f64) -> impl IntoElement {
+pub(crate) fn bar(theme: &Theme, used_percent: f64) -> impl IntoElement {
     let fraction = (used_percent / 100.0).clamp(0.0, 1.0) as f32;
     div()
         .h(px(4.0))

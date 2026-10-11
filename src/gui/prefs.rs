@@ -8,6 +8,8 @@ use tracing::warn;
 
 pub(crate) const MIN_FONT_SIZE: f32 = 10.0;
 pub(crate) const MAX_FONT_SIZE: f32 = 24.0;
+pub(crate) const MIN_SIDEBAR_WIDTH: f32 = 200.0;
+pub(crate) const MAX_SIDEBAR_WIDTH: f32 = 560.0;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -19,6 +21,8 @@ pub(crate) struct GuiPrefs {
     pub(crate) remote_usage: bool,
     /// Download new desktop releases in the background; installing still asks to restart.
     pub(crate) auto_download_updates: bool,
+    /// Sidebar width in pixels, set by dragging its edge.
+    pub(crate) sidebar_width: f32,
 }
 
 impl Default for GuiPrefs {
@@ -28,6 +32,7 @@ impl Default for GuiPrefs {
             usage_enabled: true,
             remote_usage: true,
             auto_download_updates: true,
+            sidebar_width: 264.0,
         }
     }
 }
@@ -46,6 +51,9 @@ impl GuiPrefs {
             Self::default()
         });
         prefs.font_size = prefs.font_size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+        prefs.sidebar_width = prefs
+            .sidebar_width
+            .clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
         prefs
     }
 
@@ -69,5 +77,6 @@ mod tests {
         assert_eq!(prefs.font_size, 16.0);
         assert!(prefs.usage_enabled);
         assert!(prefs.remote_usage);
+        assert_eq!(prefs.sidebar_width, 264.0);
     }
 }

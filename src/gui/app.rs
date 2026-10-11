@@ -12,8 +12,8 @@ use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures::StreamExt as _;
 use gpui::{
     canvas, div, prelude::*, px, AnyElement, ClickEvent, ClipboardItem, Context, FocusHandle, Hsla,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
-    ScrollDelta, ScrollWheelEvent, SharedString, Timer, Window,
+    KeyDownEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Pixels, Point, ScrollDelta, ScrollWheelEvent, SharedString, Timer, Window,
 };
 use tracing::warn;
 
@@ -28,8 +28,9 @@ use super::connection::{
 use super::dialog::{Dialog, DialogOutcome, DialogSubmit};
 use super::host::{retry_delay, status_priority, HostState, HostStatus};
 use super::host_form::{HostForm, HostFormOutcome};
+use super::machine_stats::{self, MachineStats};
 use super::menu::{self, Command, ContextMenu, MenuItem};
-use super::prefs::GuiPrefs;
+use super::prefs::{GuiPrefs, MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH};
 use super::settings::{
     self, LimitsRow, MachineRow, SettingsSection, SettingsView, UpdateAction, UpdateView,
 };
@@ -39,8 +40,105 @@ use super::updater::{self, UpdateStatus};
 use super::usage::{AgentKind, LocalScanner};
 use super::usage_view::{self, UsageState};
 
-const SIDEBAR_WIDTH: f32 = 264.0;
 const USAGE_REFRESH: Duration = Duration::from_secs(60);
+/// Gap between machine CPU/memory/network samples; each sample itself takes about a second.
+const STATS_REFRESH: Duration = Duration::from_secs(4);
+
+/// A tab being dragged by its grip to a new position.
+struct DraggedTab {
+    tab_id: String,
+    index: usize,
+}
+
+/// A pane being dragged by its top grip onto another pane to swap them.
+struct DraggedPane {
+    pane_id: String,
+}
+
+/// What follows the pointer while dragging a tab or pane.
+struct DragPreview {
+    label: SharedString,
+    bg: Hsla,
+    fg: Hsla,
+    border: Hsla,
+}
+
+impl Render for DragPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(px(10.0))
+            .py(px(4.0))
+            .rounded(px(6.0))
+            .text_sm()
+            .bg(self.bg)
+            .text_color(self.fg)
+            .border_1()
+            .border_color(self.border)
+            .child(self.label.clone())
+    }
+}
+
+fn drag_preview(
+    label: impl Into<SharedString>,
+    theme: &Theme,
+    cx: &mut gpui::App,
+) -> gpui::Entity<DragPreview> {
+    let preview = DragPreview {
+        label: label.into(),
+        bg: theme.panel_bg,
+        fg: theme.text,
+        border: theme.border,
+    };
+    cx.new(|_| preview)
+}
+
+/// Whether the app shortcut modifier is down: Cmd on macOS, Ctrl+Shift elsewhere.
+fn app_chord_held(modifiers: &gpui::Modifiers) -> bool {
+    if cfg!(target_os = "macos") {
+        modifiers.platform && !modifiers.control
+    } else {
+        modifiers.control && modifiers.shift
+    }
+}
+
+/// Shortcut label shown on the `index`th tab (0-based) while the app modifier is held.
+fn tab_shortcut_label(index: usize, count: usize) -> Option<String> {
+    let prefix = if cfg!(target_os = "macos") {
+        "⌘"
+    } else {
+        "Ctrl+Shift+"
+    };
+    let number = match index {
+        0..8 => index + 1,
+        _ if index + 1 == count => 9,
+        _ => return None,
+    };
+    Some(format!("{prefix}{number}"))
+}
+
+/// `tab.move` inserts before `insert_index`, counted before the moved tab is removed, so
+/// dropping onto a tab to its right inserts after that tab.
+fn tab_insert_index(from: usize, onto: usize) -> Option<usize> {
+    match from.cmp(&onto) {
+        std::cmp::Ordering::Equal => None,
+        std::cmp::Ordering::Less => Some(onto + 1),
+        std::cmp::Ordering::Greater => Some(onto),
+    }
+}
+
+/// The grip at the top centre of a pane, relative to the terminal's origin.
+fn pane_grip_bounds(
+    pane: &crate::protocol::PaneSurfacePane,
+    metrics: &CellMetrics,
+) -> gpui::Bounds<Pixels> {
+    let (width, height) = (px(40.0), px(8.0));
+    let center = metrics.cell_width * (f32::from(pane.rect.x) + f32::from(pane.rect.width) / 2.0);
+    let top = metrics.line_height * f32::from(pane.rect.y);
+    gpui::Bounds::new(
+        gpui::point(center - width / 2.0, top),
+        gpui::size(width, height),
+    )
+}
 /// Fewest milliseconds between resizes sent while the window is being dragged; the TUI
 /// client polls its terminal size at the same 100ms cadence.
 const RESIZE_INTERVAL: Duration = Duration::from_millis(100);
@@ -85,6 +183,12 @@ pub(crate) struct GuiApp {
     dark_appearance: bool,
     usage_next: Instant,
     local_usage: Arc<Mutex<LocalScanner>>,
+    /// Latest CPU/memory/network sample per machine.
+    machine_stats: HashMap<ClientEndpointId, Result<MachineStats, String>>,
+    stats_next: Instant,
+    stats_loading: bool,
+    /// The sidebar edge is being dragged.
+    sidebar_dragging: bool,
     logo: Arc<gpui::Image>,
     /// Open dialog and the machine its action applies to.
     dialog: Option<(usize, Dialog)>,
@@ -165,6 +269,10 @@ impl GuiApp {
             dark_appearance: is_dark(window.appearance()),
             usage_next: Instant::now(),
             local_usage: Arc::new(Mutex::new(LocalScanner::default())),
+            machine_stats: HashMap::new(),
+            stats_next: Instant::now(),
+            stats_loading: false,
+            sidebar_dragging: false,
             logo: Arc::new(gpui::Image::from_bytes(
                 gpui::ImageFormat::Png,
                 LOGO_PNG.to_vec(),
@@ -415,6 +523,9 @@ impl GuiApp {
                 self.check_for_updates(false, cx);
             }
         }
+        if now >= self.stats_next && self.refresh_machine_stats(cx) {
+            self.stats_next = now + STATS_REFRESH;
+        }
         // A machine that is still connecting is retried every tick until it can be read.
         if self.prefs.usage_enabled
             && now >= self.usage_next
@@ -447,6 +558,7 @@ impl GuiApp {
         let previous = self.selected;
         self.selected = index;
         self.usage_next = Instant::now();
+        self.stats_next = Instant::now();
         if self.hosts[previous].supports_surface_interest() {
             self.hosts[previous].set_surface_active(false);
         }
@@ -552,6 +664,73 @@ impl GuiApp {
         );
     }
 
+    /// Moves a dragged tab to where another tab sits.
+    fn drop_tab(&mut self, dragged: &DraggedTab, target: usize) {
+        let Some(insert_index) = tab_insert_index(dragged.index, target) else {
+            return;
+        };
+        self.request(
+            "tab.move",
+            serde_json::json!({ "tab_id": dragged.tab_id, "insert_index": insert_index }),
+        );
+    }
+
+    /// Whether `position` (window coordinates) is on a pane's drag grip.
+    fn on_pane_grip(&self, position: Point<Pixels>) -> bool {
+        let (Some(surface), Some(metrics)) = (&self.selected_host().surface, &self.metrics) else {
+            return false;
+        };
+        let origin = self.terminal_origin.get();
+        let local = gpui::point(position.x - origin.x, position.y - origin.y);
+        surface.panes.len() > 1
+            && surface
+                .panes
+                .iter()
+                .any(|pane| pane_grip_bounds(pane, metrics).contains(&local))
+    }
+
+    /// Swaps a dragged pane with the pane under the pointer.
+    fn drop_pane(&mut self, dragged: &DraggedPane, position: Point<Pixels>) {
+        let Some((col, row)) = self.mouse_cell(position) else {
+            return;
+        };
+        let target = self
+            .selected_host()
+            .surface
+            .as_ref()
+            .and_then(|surface| terminal::pane_at(&surface.panes, col, row))
+            .map(|pane| pane.pane_id.clone());
+        if let Some(target) = target.filter(|target| *target != dragged.pane_id) {
+            self.request(
+                "pane.swap",
+                serde_json::json!({ "source_pane_id": dragged.pane_id, "target_pane_id": target }),
+            );
+        }
+    }
+
+    /// Focuses the `number`th tab (1-based) of the focused workspace; 9 is the last tab,
+    /// as in browsers.
+    fn focus_tab_number(&mut self, number: u8) {
+        let Some(snapshot) = &self.selected_host().snapshot else {
+            return;
+        };
+        let workspace_id = snapshot.focused_workspace_id.as_ref();
+        let tabs: Vec<_> = snapshot
+            .tabs
+            .iter()
+            .filter(|tab| Some(&tab.workspace_id) == workspace_id)
+            .collect();
+        let tab = if number == 9 {
+            tabs.last()
+        } else {
+            tabs.get(usize::from(number) - 1)
+        };
+        if let Some(tab) = tab {
+            let tab_id = tab.tab_id.clone();
+            self.request("tab.focus", serde_json::json!({ "tab_id": tab_id }));
+        }
+    }
+
     fn new_workspace(&mut self) {
         let (workspace_id, _, _) = self.focused_ids();
         self.request(
@@ -605,6 +784,7 @@ impl GuiApp {
         self.hosts[index].disconnect(HostStatus::Offline("removed".into()));
         let id = self.hosts.remove(index).id;
         self.usage.remove(&id);
+        self.machine_stats.remove(&id);
         if self.selected > index {
             self.selected -= 1;
         }
@@ -646,12 +826,7 @@ impl GuiApp {
             return;
         }
         let modifiers = &keystroke.modifiers;
-        let app_chord = if cfg!(target_os = "macos") {
-            modifiers.platform && !modifiers.control
-        } else {
-            modifiers.control && modifiers.shift
-        };
-        if app_chord {
+        if app_chord_held(modifiers) {
             let handled = match keystroke.key.as_str() {
                 "v" => {
                     self.paste(cx);
@@ -675,6 +850,10 @@ impl GuiApp {
                 }
                 "w" => {
                     self.close_pane();
+                    true
+                }
+                key @ ("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9") => {
+                    self.focus_tab_number(key.as_bytes()[0] - b'0');
                     true
                 }
                 _ => false,
@@ -838,6 +1017,36 @@ impl GuiApp {
         } else {
             window.focus(&self.terminal_focus);
         }
+    }
+
+    // ----- machine stats ---------------------------------------------------
+
+    /// Samples the selected machine; false when it can't be read yet.
+    fn refresh_machine_stats(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.stats_loading {
+            return true;
+        }
+        let host = self.selected_host();
+        let target = match &host.target {
+            HostTarget::Local => None,
+            HostTarget::Ssh { target, .. } if host.is_online() => Some(target.clone()),
+            HostTarget::Ssh { .. } => return false,
+        };
+        let id = host.id.clone();
+        self.stats_loading = true;
+        let sample = cx
+            .background_executor()
+            .spawn(async move { machine_stats::sample(target.as_deref()) });
+        cx.spawn(async move |this, cx| {
+            let result = sample.await.map_err(|error| error.to_string());
+            let _ = this.update(cx, |this, cx| {
+                this.stats_loading = false;
+                this.machine_stats.insert(id, result);
+                cx.notify();
+            });
+        })
+        .detach();
+        true
     }
 
     // ----- usage -----------------------------------------------------------
@@ -1679,23 +1888,34 @@ impl GuiApp {
                 .child(div().flex_1().text_sm().child("herdr"))
                 .child(
                     div()
-                        .id("open-settings")
+                        .id("window-grip")
                         .px(px(6.0))
-                        .py(px(2.0))
                         .rounded(px(5.0))
                         .text_color(theme.text_muted)
-                        .cursor_pointer()
+                        .cursor_grab()
                         .hover(|style| style.bg(theme.hover).text_color(theme.text))
-                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                            this.open_settings(window, cx);
-                            cx.notify();
-                        }))
-                        .flex_none()
-                        .text_sm()
-                        .whitespace_nowrap()
-                        .child("⚙ Settings"),
+                        .on_mouse_down(MouseButton::Left, |_, window, _| {
+                            window.start_window_move();
+                        })
+                        .child("⠿"),
                 ),
         );
+        let settings_button = div()
+            .id("open-settings")
+            .px(px(6.0))
+            .py(px(2.0))
+            .rounded(px(5.0))
+            .text_color(theme.text_muted)
+            .cursor_pointer()
+            .hover(|style| style.bg(theme.hover).text_color(theme.text))
+            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                this.open_settings(window, cx);
+                cx.notify();
+            }))
+            .flex_none()
+            .text_sm()
+            .whitespace_nowrap()
+            .child("⚙ Settings");
         list = list.child(section_title("MACHINES", theme));
 
         for (index, host) in self.hosts.iter().enumerate() {
@@ -2001,6 +2221,13 @@ impl GuiApp {
             );
         }
 
+        if let Some(stats) = self.machine_stats.get(&self.selected_host().id) {
+            list = list
+                .child(div().h(px(12.0)))
+                .child(section_title("MACHINE", theme))
+                .child(machine_stats_view(stats, theme));
+        }
+
         if self.prefs.usage_enabled {
             list = list
                 .child(div().h(px(12.0)))
@@ -2038,19 +2265,80 @@ impl GuiApp {
             }
         }
 
-        div()
-            .id("sidebar")
-            .flex_none()
-            .w(px(SIDEBAR_WIDTH))
+        let resize_handle = div()
+            .id("sidebar-resize")
+            .absolute()
+            .top_0()
+            .right(px(-3.0))
+            .w(px(6.0))
             .h_full()
-            .overflow_y_scroll()
+            .cursor_col_resize()
+            .hover(|style| style.bg(theme.border))
+            .when(self.sidebar_dragging, |handle| handle.bg(theme.border))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    this.sidebar_dragging = true;
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            );
+
+        div()
+            .relative()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .w(px(self.prefs.sidebar_width))
+            .h_full()
             .bg(theme.sidebar_bg)
             .border_r_1()
             .border_color(theme.border)
-            .child(list)
+            .child(
+                div()
+                    .id("sidebar")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(list),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .p(px(8.0))
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .child(settings_button),
+            )
+            .child(resize_handle)
     }
 
-    fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn drag_sidebar(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if !self.sidebar_dragging {
+            return;
+        }
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.finish_sidebar_drag(cx);
+            return;
+        }
+        self.prefs.sidebar_width =
+            f32::from(event.position.x).clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
+        cx.notify();
+    }
+
+    fn finish_sidebar_drag(&mut self, cx: &mut Context<Self>) {
+        if !self.sidebar_dragging {
+            return;
+        }
+        self.sidebar_dragging = false;
+        if let Err(error) = self.prefs.store() {
+            warn!(%error, "could not save the sidebar width");
+        }
+        cx.notify();
+    }
+
+    fn render_tab_bar(&self, show_shortcuts: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = &self.theme;
         let bar = div()
             .flex()
@@ -2073,12 +2361,37 @@ impl GuiApp {
             .overflow_hidden();
         if let Some(snapshot) = &self.selected_host().snapshot {
             let workspace_id = snapshot.focused_workspace_id.clone();
+            let tab_count = snapshot
+                .tabs
+                .iter()
+                .filter(|tab| Some(&tab.workspace_id) == workspace_id.as_ref())
+                .count();
             for (index, tab) in snapshot
                 .tabs
                 .iter()
                 .filter(|tab| Some(&tab.workspace_id) == workspace_id.as_ref())
                 .enumerate()
             {
+                let drop_highlight = theme.hover;
+                let preview_label = tab.label.clone();
+                let preview_theme = theme.clone();
+                let grip = div()
+                    .id(("tab-grip", index))
+                    .flex_none()
+                    .text_xs()
+                    .text_color(theme.text_muted)
+                    .cursor_grab()
+                    .on_drag(
+                        DraggedTab {
+                            tab_id: tab.tab_id.clone(),
+                            index,
+                        },
+                        move |_, _, _, cx| drag_preview(preview_label.clone(), &preview_theme, cx),
+                    )
+                    .child("⋮⋮");
+                let shortcut = show_shortcuts
+                    .then(|| tab_shortcut_label(index, tab_count))
+                    .flatten();
                 let tab_id = tab.tab_id.clone();
                 let close_id = tab.tab_id.clone();
                 let menu_tab_id = tab.tab_id.clone();
@@ -2115,6 +2428,24 @@ impl GuiApp {
                         .hover(|style| style.bg(theme.hover))
                         .when(tab.focused, |tab| tab.bg(theme.selected))
                         .when(!tab.focused, |tab| tab.text_color(theme.text_muted))
+                        .drag_over::<DraggedTab>(move |style, _, _, _| style.bg(drop_highlight))
+                        .on_drop(cx.listener(move |this, dragged: &DraggedTab, _, cx| {
+                            this.drop_tab(dragged, index);
+                            cx.notify();
+                        }))
+                        .child(grip)
+                        .when_some(shortcut, |tab, shortcut| {
+                            tab.child(
+                                div()
+                                    .flex_none()
+                                    .px(px(4.0))
+                                    .rounded(px(4.0))
+                                    .text_xs()
+                                    .bg(theme.border)
+                                    .text_color(theme.text)
+                                    .child(shortcut),
+                            )
+                        })
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                             this.request("tab.focus", serde_json::json!({ "tab_id": tab_id }));
                             cx.notify();
@@ -2204,6 +2535,35 @@ impl GuiApp {
         let entity = cx.entity().downgrade();
         let window_active = window.is_window_active();
 
+        let mut pane_grips = Vec::new();
+        if let (Some(surface), Some(metrics)) = (&surface, &metrics) {
+            if surface.panes.len() > 1 {
+                for pane in &surface.panes {
+                    let bounds = pane_grip_bounds(pane, metrics);
+                    let preview_theme = theme.clone();
+                    pane_grips.push(
+                        div()
+                            .id(SharedString::from(format!("pane-grip-{}", pane.pane_id)))
+                            .absolute()
+                            .left(bounds.origin.x)
+                            .top(bounds.origin.y)
+                            .w(bounds.size.width)
+                            .h(bounds.size.height)
+                            .rounded_full()
+                            .bg(theme.border)
+                            .hover(|style| style.bg(theme.text_muted))
+                            .cursor_grab()
+                            .on_drag(
+                                DraggedPane {
+                                    pane_id: pane.pane_id.clone(),
+                                },
+                                move |_, _, _, cx| drag_preview("Move pane", &preview_theme, cx),
+                            ),
+                    );
+                }
+            }
+        }
+
         let surface_canvas = canvas(
             {
                 let metrics = metrics.clone();
@@ -2250,7 +2610,7 @@ impl GuiApp {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                    if this.modal_open() {
+                    if this.modal_open() || this.on_pane_grip(event.position) {
                         return;
                     }
                     window.focus(&this.terminal_focus);
@@ -2316,7 +2676,10 @@ impl GuiApp {
                     );
                 }),
             )
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, _| {
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                if cx.has_active_drag() {
+                    return;
+                }
                 let Some(button) = event.pressed_button.and_then(terminal::mouse_button) else {
                     return;
                 };
@@ -2331,7 +2694,12 @@ impl GuiApp {
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, _| {
                 this.on_terminal_scroll(event);
             }))
+            .on_drop(cx.listener(|this, dragged: &DraggedPane, window, cx| {
+                this.drop_pane(dragged, window.mouse_position());
+                cx.notify();
+            }))
             .child(surface_canvas)
+            .children(pane_grips)
             .when_some(placeholder, |terminal, message| {
                 terminal.child(
                     div()
@@ -2347,6 +2715,59 @@ impl GuiApp {
                 )
             })
     }
+}
+
+fn machine_stats_view(stats: &Result<MachineStats, String>, theme: &Theme) -> gpui::Div {
+    let row = |label: &'static str, value: String, percent: Option<f64>| {
+        let mut row = div().flex().flex_col().gap(px(2.0)).px(px(8.0)).child(
+            div()
+                .flex()
+                .text_xs()
+                .child(div().flex_1().text_color(theme.text_muted).child(label))
+                .child(value),
+        );
+        if let Some(percent) = percent {
+            row = row.child(usage_view::bar(theme, percent));
+        }
+        row
+    };
+    let stats = match stats {
+        Ok(stats) => stats,
+        Err(error) => {
+            return div()
+                .px(px(8.0))
+                .text_xs()
+                .text_color(theme.text_muted)
+                .child(error.clone());
+        }
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(6.0))
+        .child(row(
+            "CPU",
+            format!("{:.0}%", stats.cpu_percent),
+            Some(stats.cpu_percent),
+        ))
+        .child(row(
+            "Memory",
+            format!(
+                "{} / {}",
+                machine_stats::format_bytes(stats.mem_used),
+                machine_stats::format_bytes(stats.mem_total)
+            ),
+            Some(stats.mem_percent()),
+        ))
+        .child(row(
+            "Network",
+            format!(
+                "↓ {}/s  ↑ {}/s",
+                machine_stats::format_bytes(stats.net_rx_per_sec),
+                machine_stats::format_bytes(stats.net_tx_per_sec)
+            ),
+            None,
+        ))
 }
 
 fn section_title(title: &'static str, theme: &Theme) -> impl IntoElement {
@@ -2445,6 +2866,16 @@ impl Render for GuiApp {
             .size_full()
             .bg(theme.terminal_bg)
             .text_color(theme.text)
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                this.drag_sidebar(event, cx);
+            }))
+            // Tab shortcut hints show while the app modifier is held.
+            .on_modifiers_changed(cx.listener(|_, _: &ModifiersChangedEvent, _, cx| cx.notify()))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| this.finish_sidebar_drag(cx)),
+            )
+            .when(self.sidebar_dragging, |root| root.cursor_col_resize())
             .child(self.render_sidebar(cx))
             .child(
                 div()
@@ -2453,7 +2884,7 @@ impl Render for GuiApp {
                     .flex_1()
                     .min_w_0()
                     .children(self.render_update_banner(cx))
-                    .child(self.render_tab_bar(cx))
+                    .child(self.render_tab_bar(app_chord_held(&window.modifiers()), cx))
                     .child(self.render_terminal(window, cx))
                     .when_some(notice, |column, notice| {
                         column.child(
@@ -2481,6 +2912,23 @@ impl Render for GuiApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tab_shortcuts_cover_the_first_eight_and_the_last_tab() {
+        let digit = |index, count| tab_shortcut_label(index, count).and_then(|l| l.chars().last());
+        assert_eq!(digit(0, 3), Some('1'));
+        assert_eq!(digit(7, 12), Some('8'));
+        assert_eq!(digit(8, 12), None);
+        assert_eq!(digit(11, 12), Some('9'));
+    }
+
+    #[test]
+    fn dropping_a_tab_lands_on_the_target_position() {
+        assert_eq!(tab_insert_index(2, 2), None);
+        // Tab 0 dropped on tab 2 ends up third: insert before index 3.
+        assert_eq!(tab_insert_index(0, 2), Some(3));
+        assert_eq!(tab_insert_index(3, 1), Some(1));
+    }
 
     #[test]
     fn resizes_wait_for_the_previous_answer_and_the_interval() {
