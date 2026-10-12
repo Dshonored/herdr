@@ -36,7 +36,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(16);
+pub(crate) const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(16);
 const MIN_MAX_FPS: u16 = 30;
 const MAX_MAX_FPS: u16 = 240;
 
