@@ -196,7 +196,10 @@ fn open(
         geometry.size.rows,
         geometry.cell_width_px,
         geometry.cell_height_px,
-        false,
+        crate::client::HandshakePixelCapabilities {
+            exact_geometry: false,
+            sgr_mouse: false,
+        },
         Some(geometry.size),
         false,
         true,

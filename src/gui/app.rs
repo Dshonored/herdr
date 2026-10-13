@@ -11,10 +11,10 @@ use std::time::{Duration, Instant};
 use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures::StreamExt as _;
 use gpui::{
-    canvas, div, prelude::*, px, Animation, AnimationExt, AnyElement, ClickEvent, ClipboardItem,
-    Context, DragMoveEvent, FocusHandle, Hsla, KeyDownEvent, ModifiersChangedEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta, ScrollWheelEvent,
-    SharedString, Timer, Window,
+    canvas, div, prelude::*, px, Animation, AnimationExt, AnyElement, ClickEvent, ClipboardEntry,
+    ClipboardItem, Context, DragMoveEvent, FocusHandle, Hsla, KeyDownEvent, ModifiersChangedEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta,
+    ScrollWheelEvent, SharedString, Timer, Window,
 };
 use tracing::warn;
 
@@ -29,6 +29,7 @@ use super::connection::{
 use super::dialog::{Dialog, DialogOutcome, DialogSubmit};
 use super::host::{retry_delay, status_priority, HostState, HostStatus};
 use super::host_form::{HostForm, HostFormOutcome};
+use super::image_paste;
 use super::machine_stats::{self, MachineStats};
 use super::menu::{self, Command, ContextMenu, MenuItem};
 use super::prefs::{GuiPrefs, MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH};
@@ -801,12 +802,63 @@ impl GuiApp {
     }
 
     fn paste(&mut self, cx: &mut Context<Self>) {
-        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+        let Some(item) = cx.read_from_clipboard() else {
             return;
         };
-        if let (_, _, Some(pane_id)) = self.focused_ids() {
+        let (_, _, Some(pane_id)) = self.focused_ids() else {
+            return;
+        };
+        if let Some(text) = item.text() {
             self.send_pane_input(pane_id, vec![ClientPaneInputEvent::Paste(text)]);
+            return;
         }
+        let image = item.into_entries().find_map(|entry| match entry {
+            ClipboardEntry::Image(image) => Some(image),
+            ClipboardEntry::String(_) => None,
+        });
+        if let Some(image) = image {
+            self.paste_image(pane_id, image, cx);
+        }
+    }
+
+    /// Saves a clipboard image on the pane's machine and pastes its path.
+    fn paste_image(&mut self, pane_id: String, image: gpui::Image, cx: &mut Context<Self>) {
+        let host = self.selected_host();
+        let id = host.id.clone();
+        let target = match &host.target {
+            HostTarget::Local => None,
+            HostTarget::Ssh { target, .. } => Some(target.clone()),
+        };
+        let extension = image_paste::extension(image.format);
+        let save = cx.background_executor().spawn(async move {
+            match target {
+                None => image_paste::save_local(&image.bytes, extension),
+                Some(target) => image_paste::upload_remote(&target, &image.bytes, extension),
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let result = save.await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(path) => {
+                        if let Some(host) = this.hosts.iter_mut().find(|host| host.id == id) {
+                            host.send(&ClientMessage::ClientShellPaneInput {
+                                pane_id,
+                                events: vec![ClientPaneInputEvent::Paste(image_paste::paste_text(
+                                    &path,
+                                ))],
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "could not paste clipboard image");
+                        this.show_notice(format!("could not paste image: {error}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn remove_host(&mut self, index: usize) {

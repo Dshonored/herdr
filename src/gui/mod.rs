@@ -13,6 +13,7 @@ mod dialog;
 mod host;
 mod host_form;
 mod host_keys;
+mod image_paste;
 mod machine_stats;
 mod menu;
 mod prefs;

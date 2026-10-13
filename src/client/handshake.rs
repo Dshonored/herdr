@@ -161,9 +161,9 @@ pub(crate) fn probe_endpoint_negotiation(
     ))
 }
 
-pub(super) struct HandshakePixelCapabilities {
-    pub(super) exact_geometry: bool,
-    pub(super) sgr_mouse: bool,
+pub(crate) struct HandshakePixelCapabilities {
+    pub(crate) exact_geometry: bool,
+    pub(crate) sgr_mouse: bool,
 }
 
 /// Performs the client→server handshake.

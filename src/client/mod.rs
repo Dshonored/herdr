@@ -129,9 +129,8 @@ use frame_output::{
 };
 pub(crate) use handshake::do_handshake;
 pub(crate) use handshake::probe_endpoint_negotiation;
-use handshake::{
-    client_shell_keybinding_source, is_remote_client_process, HandshakePixelCapabilities,
-};
+pub(crate) use handshake::HandshakePixelCapabilities;
+use handshake::{client_shell_keybinding_source, is_remote_client_process};
 #[cfg(test)]
 use handshake::{
     direct_graphics_profile_values, handshake_read_timeout, REMOTE_HANDSHAKE_READ_TIMEOUT,
